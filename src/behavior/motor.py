@@ -20,7 +20,7 @@ import math
 import random
 from typing import TYPE_CHECKING
 
-from src.behavior.player_state import AimPhase, MotorPhase
+from src.behavior.player_state import AimPhase, MotorPhase, TargetStatus
 from src.utils.math_helpers import screen_delta_to_mouse
 
 if TYPE_CHECKING:
@@ -79,7 +79,7 @@ class MotorPlanner:
             return self._idle_micro_steadiness(state)
 
         target = state.primary_target
-        if target is None:
+        if target is None or target.status == TargetStatus.FORGOTTEN:
             self._decay_velocity()
             return (0, 0)
 
@@ -127,6 +127,10 @@ class MotorPlanner:
         mouse_dx, mouse_dy = auth_aim.motor_error
         err_dist_px = auth_aim.screen_error_dist
 
+        # If target is briefly lost or reacquiring, execute reacquisition
+        if target.status in (TargetStatus.BRIEFLY_LOST, TargetStatus.REACQUIRING):
+            return self._execute_reacquisition(state, mouse_dx, mouse_dy, err_dist_px)
+
         if aim == AimPhase.ACQUIRING:
             return self._execute_acquisition_episode(state, mouse_dx, mouse_dy, err_dist_px)
         elif aim == AimPhase.CORRECTING:
@@ -156,7 +160,7 @@ class MotorPlanner:
         mouse_dy: float,
         err_dist_px: float,
     ) -> tuple[int, int]:
-        """Execute a multi-tick reaching movement with bell-shaped velocity profile."""
+        """Execute a multi-tick reaching movement with bell-shaped minimum jerk velocity profile."""
         p = self.personality
         episode = state.motor_episode
         now = state.now
@@ -170,6 +174,7 @@ class MotorPlanner:
             episode.duration = max(0.066, duration)
             episode.start_error_counts = (mouse_dx, mouse_dy)
             episode.target_displacement_counts = (mouse_dx, mouse_dy)
+            episode.traversed_fraction = 0.0
             episode.phase = "primary"
             episode.submovements_planned = (
                 1 if (p.motor_precision > 0.65 and err_dist_px < 80) else 2
@@ -177,35 +182,46 @@ class MotorPlanner:
             episode.submovements_completed = 0
             episode.accepted_error_px = 7.0 + (1.0 - p.motor_precision) * 15.0
 
-        # 2. Progress through primary movement
-        elapsed = now - episode.start_time
-        progress = min(1.0, elapsed / episode.duration)
-        state.motor_progress = progress
+        # 2. Progress through primary movement strictly as a function of elapsed episode time
+        dt = max(0.010, min(0.100, state.tick_dt))
+        elapsed = (now - episode.start_time) + dt
+        tau = min(1.0, max(0.0, elapsed / episode.duration))
+        state.motor_progress = tau
         state.motor_phase = MotorPhase.FLICKING
 
-        # Bell-shaped velocity weighting (minimum jerk trajectory profile)
-        # Velocity curve: 30 * t^2 * (1-t)^2 normalized
-        vel_weight = 30.0 * (progress**2) * ((1.0 - progress) ** 2)
-        # Fraction of remaining distance to traverse this tick
-        fraction = max(0.15, min(0.95, vel_weight * state.tick_dt * 8.0 + 0.2))
+        # Minimum jerk normalized position: s(tau) = 10*tau^3 - 15*tau^4 + 6*tau^5
+        s_pos = 10.0 * (tau**3) - 15.0 * (tau**4) + 6.0 * (tau**5)
+        # Fractional step for this tick
+        delta_s = max(0.0, s_pos - episode.traversed_fraction)
+        episode.traversed_fraction = s_pos
 
-        # Primary movement towards target
-        target_vx = mouse_dx * fraction
-        target_vy = mouse_dy * fraction
+        # Base displacement along planned trajectory
+        disp_x, disp_y = episode.target_displacement_counts
+        target_vx = disp_x * delta_s
+        target_vy = disp_y * delta_s
+
+        # Adaptive target visual feedback during latter half of reaching movement
+        if tau > 0.4:
+            rem_planned_x = disp_x * (1.0 - s_pos)
+            rem_planned_y = disp_y * (1.0 - s_pos)
+            feedback_x = (mouse_dx - rem_planned_x) * (0.25 * tau)
+            feedback_y = (mouse_dy - rem_planned_y) * (0.25 * tau)
+            target_vx += feedback_x
+            target_vy += feedback_y
 
         # Signal-dependent motor noise (proportional to movement amplitude)
         speed = math.hypot(target_vx, target_vy)
         sd_noise = speed * (1.0 - p.motor_precision) * 0.08
-        target_vx += random.gauss(0, sd_noise) + self._bias_x * 0.3
-        target_vy += random.gauss(0, sd_noise) + self._bias_y * 0.3
+        target_vx += random.gauss(0, sd_noise) + self._bias_x * 0.25
+        target_vy += random.gauss(0, sd_noise) + self._bias_y * 0.25
 
         # Blend with current momentum for physical continuity
-        blend = min(0.85, 0.4 + p.motor_speed * 0.3)
+        blend = min(0.85, 0.40 + p.motor_speed * 0.30)
         self._velocity_x = self._velocity_x * (1.0 - blend) + target_vx * blend
         self._velocity_y = self._velocity_y * (1.0 - blend) + target_vy * blend
 
         # Check primary movement completion / transition to evaluation
-        if progress >= 0.85 or err_dist_px <= max(25.0, episode.accepted_error_px * 2.0):
+        if tau >= 0.88 or err_dist_px <= max(25.0, episode.accepted_error_px * 2.0):
             episode.phase = "evaluating"
             state.aim_phase = AimPhase.CORRECTING
             state.motor_phase = MotorPhase.SETTLING

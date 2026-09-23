@@ -185,3 +185,49 @@ def test_synthetic_engagement_timeline_metrics():
     mov_metrics = recorder.compute_movement_metrics()
     if mov_metrics["episode_count"] > 2:
         assert mov_metrics["alternation_ratio"] < 1.0
+
+
+def test_mouse_velocity_metrics_and_continuity():
+    """Verify velocity metrics capture smooth acceleration/deceleration continuity."""
+    recorder = BehaviorRecorder()
+    state = PlayerState()
+    state.is_alive = True
+
+    # Simulate smooth flick trajectory (0 -> peak -> 0)
+    profile = [0, 2, 8, 20, 35, 40, 32, 18, 6, 2, 0]
+    for i, speed in enumerate(profile):
+        state._now = 1.0 + i * 0.033
+        recorder.record_tick(state, motor_dx=speed, motor_dy=0)
+
+    metrics = recorder.compute_mouse_velocity_metrics()
+    assert metrics["max_speed"] == 40.0
+    assert metrics["mean_speed"] > 0.0
+    assert metrics["mean_acceleration"] > 0.0
+    # Velocity is smoothly correlated, not noise
+    assert metrics["velocity_autocorr"] > 0.3
+
+
+def test_tap_interval_metrics_distribution():
+    """Verify tap interval metrics measure human inter-shot timing and variance."""
+    recorder = BehaviorRecorder()
+    state = PlayerState()
+    state.is_alive = True
+
+    intervals = [0.180, 0.210, 0.195, 0.225, 0.190]
+    t = 10.0
+    state._now = t
+    state.shot_count = 1
+    recorder.record_tick(state)
+
+    for delta in intervals:
+        t += delta
+        state._now = t
+        state.shot_count += 1
+        recorder.record_tick(state)
+
+    metrics = recorder.compute_tap_interval_metrics()
+    assert metrics["shot_count"] == 6.0
+    assert metrics["interval_count"] == 5.0
+    assert 0.180 <= metrics["mean_interval"] <= 0.220
+    assert metrics["std_interval"] > 0.005  # Human timing jitter present
+    assert metrics["min_interval"] >= 0.150

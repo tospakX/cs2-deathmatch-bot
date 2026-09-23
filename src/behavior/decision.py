@@ -67,7 +67,15 @@ class DecisionEngine:
         self.reaction = ReactionSystem(personality)
         self.firing = FiringController(personality, weapon)
         self.movement = MovementController(personality)
-        self.scanning = ScanningController(personality, screen_center)
+        self.scanning = ScanningController(
+            personality,
+            screen_center,
+            sensitivity=sensitivity,
+            m_yaw=m_yaw,
+            m_pitch=m_pitch,
+            screen_size=(screen_width, screen_height),
+            fov_h=fov_h,
+        )
         self.adaptation = AdaptationEngine(personality)
         self._prev_primary_target: TrackedTarget | None = None
 

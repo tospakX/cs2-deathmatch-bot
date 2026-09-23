@@ -136,14 +136,19 @@ class BehaviorRecorder:
 
     def compute_movement_metrics(self) -> dict[str, float]:
         """Verify that movement directions do NOT follow robotic 100% left-right alternation."""
-        dirs = [
-            r.movement_direction for r in self.records if r.movement_direction in ("left", "right")
-        ]
-        # Group into direction episodes
+        # Extract strafe episodes separated by pauses/holding or direction changes
         episodes: list[str] = []
-        for d in dirs:
-            if not episodes or d != episodes[-1]:
-                episodes.append(d)
+        in_strafe = False
+        current_dir = ""
+        for r in self.records:
+            if r.movement_phase == "STRAFING" and r.movement_direction in ("left", "right"):
+                if not in_strafe or r.movement_direction != current_dir:
+                    episodes.append(r.movement_direction)
+                    current_dir = r.movement_direction
+                    in_strafe = True
+            else:
+                in_strafe = False
+                current_dir = ""
 
         same_transitions = 0
         opposite_transitions = 0
@@ -156,11 +161,94 @@ class BehaviorRecorder:
         total = same_transitions + opposite_transitions
         alt_ratio = (opposite_transitions / total) if total > 0 else 0.0
 
+        # Also calculate raw tick persistence
+        # (fraction of consecutive ticks with identical direction)
+        raw_dirs = [
+            r.movement_direction for r in self.records if r.movement_direction in ("left", "right")
+        ]
+        tick_same = sum(1 for i in range(len(raw_dirs) - 1) if raw_dirs[i] == raw_dirs[i + 1])
+        tick_total = max(1, len(raw_dirs) - 1)
+        tick_persistence = tick_same / tick_total if raw_dirs else 0.0
+
         return {
             "episode_count": float(len(episodes)),
             "same_transitions": float(same_transitions),
             "opposite_transitions": float(opposite_transitions),
             "alternation_ratio": alt_ratio,  # 1.0 means pure robotic L-R-L-R
+            "tick_persistence": tick_persistence,
+        }
+
+    def compute_mouse_velocity_metrics(self) -> dict[str, float]:
+        """Compute mouse movement velocity continuity, peak speed, and acceleration."""
+        speeds: list[float] = []
+        accelerations: list[float] = []
+        last_speed = 0.0
+        last_t: float | None = None
+
+        for r in self.records:
+            speed = math.hypot(r.motor_dx, r.motor_dy)
+            speeds.append(speed)
+            if last_t is not None:
+                dt = max(0.001, r.timestamp - last_t)
+                accel = abs(speed - last_speed) / dt
+                accelerations.append(accel)
+            last_speed = speed
+            last_t = r.timestamp
+
+        mean_speed = (sum(speeds) / len(speeds)) if speeds else 0.0
+        max_speed = max(speeds) if speeds else 0.0
+        mean_accel = (sum(accelerations) / len(accelerations)) if accelerations else 0.0
+
+        # Autocorrelation of velocity (continuity measure)
+        autocorr = 0.0
+        if len(speeds) > 2:
+            s_mean = mean_speed
+            var = sum((s - s_mean) ** 2 for s in speeds) / len(speeds)
+            if var > 1e-6:
+                cov = sum(
+                    (speeds[i] - s_mean) * (speeds[i + 1] - s_mean) for i in range(len(speeds) - 1)
+                ) / (len(speeds) - 1)
+                autocorr = cov / var
+
+        return {
+            "mean_speed": mean_speed,
+            "max_speed": max_speed,
+            "mean_acceleration": mean_accel,
+            "velocity_autocorr": autocorr,
+        }
+
+    def compute_tap_interval_metrics(self) -> dict[str, float]:
+        """Measure shot interval distributions and timing jitter during tapping."""
+        shot_times: list[float] = []
+        last_count = 0
+        for r in self.records:
+            if r.shot_count > last_count:
+                shot_times.append(r.timestamp)
+                last_count = r.shot_count
+
+        intervals: list[float] = []
+        for i in range(len(shot_times) - 1):
+            intervals.append(shot_times[i + 1] - shot_times[i])
+
+        if not intervals:
+            return {
+                "shot_count": float(len(shot_times)),
+                "interval_count": 0.0,
+                "mean_interval": 0.0,
+                "std_interval": 0.0,
+                "min_interval": 0.0,
+            }
+
+        mean_int = sum(intervals) / len(intervals)
+        var_int = sum((x - mean_int) ** 2 for x in intervals) / len(intervals)
+        std_int = math.sqrt(var_int) if var_int > 0 else 0.0
+
+        return {
+            "shot_count": float(len(shot_times)),
+            "interval_count": float(len(intervals)),
+            "mean_interval": mean_int,
+            "std_interval": std_int,
+            "min_interval": min(intervals),
         }
 
     def compute_crouch_metrics(self) -> dict[str, float]:

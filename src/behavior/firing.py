@@ -20,7 +20,7 @@ import random
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from src.behavior.player_state import AimPhase, FiringPhase
+from src.behavior.player_state import AimPhase, FiringPhase, TargetStatus
 
 if TYPE_CHECKING:
     from src.behavior.personality import PersonalityTraits
@@ -152,6 +152,7 @@ class FiringController:
         self.weapon = weapon
         self._last_shot_time: float = 0.0
         self._recoil_bias_x: float = random.gauss(0, 0.2)
+        self._recoil_bias_y: float = random.gauss(0, 0.15)
 
     @property
     def cycle_time(self) -> float:
@@ -199,8 +200,12 @@ class FiringController:
                 state.firing_phase = FiringPhase.BURST_PAUSE
             return cmd
 
-        # If no target or still reacting, release trigger
-        if target is None or state.aim_phase in (AimPhase.REACTING, AimPhase.IDLE):
+        # If no target, target is not visible, or still reacting, release trigger
+        if (
+            target is None
+            or target.status != TargetStatus.VISIBLE
+            or state.aim_phase in (AimPhase.REACTING, AimPhase.IDLE)
+        ):
             if state.is_trigger_held:
                 cmd.trigger_action = "release"
                 state.is_trigger_held = False
@@ -316,22 +321,40 @@ class FiringController:
             )
 
     def _execute_tap(self, state: PlayerState, now: float, cmd: FiringCommand) -> FiringCommand:
-        """Single tap with recovery delay."""
+        """Single tap with contextual hold duration and recovery delay."""
         p = self.personality
         episode = state.firing_episode
         tap_interval = self.cycle_time + (0.080 + (1.0 - p.firing_discipline) * 0.120)
 
+        # If currently holding down the tap trigger
+        if state.is_trigger_held and episode.mode == "tap":
+            if (now - episode.press_time) < episode.trigger_hold_duration:
+                cmd.trigger_action = "hold"
+                cmd.is_firing = True
+                return cmd
+            else:
+                # Tap hold duration expired -> release trigger
+                cmd.trigger_action = "release"
+                state.is_trigger_held = False
+                state.firing_phase = FiringPhase.BURST_PAUSE
+                episode.active = False
+                episode.pause_until = now + tap_interval
+                return cmd
+
+        # Initiating a new tap
         if now - self._last_shot_time >= tap_interval:
             cmd.trigger_action = "press"
             state.is_trigger_held = True
             state.firing_phase = FiringPhase.TAPPING
+            episode.press_time = now
+            # Realistic physical finger press duration: 45 to 80ms
+            episode.trigger_hold_duration = random.uniform(0.045, 0.080)
             self._record_shot(state, now)
             cmd.is_firing = True
             self._apply_recoil(state, cmd)
 
             episode.shots_fired += 1
-            episode.active = False
-            episode.pause_until = now + tap_interval
+            episode.active = True
         elif state.is_trigger_held:
             cmd.trigger_action = "release"
             state.is_trigger_held = False
@@ -358,10 +381,10 @@ class FiringController:
                 cmd.trigger_action = "release"
                 state.is_trigger_held = False
                 state.firing_phase = FiringPhase.BURST_PAUSE
-                pause_time = 0.180 + p.firing_discipline * 0.220
-                episode.pause_until = now + pause_time
+                # Inter-burst pause with human motor timing jitter
+                pause_time = 0.160 + p.firing_discipline * 0.200 + random.uniform(-0.025, 0.035)
+                episode.pause_until = now + max(0.080, pause_time)
                 episode.active = False
-                state.reset_spray()
         else:
             if state.is_trigger_held:
                 cmd.trigger_action = "hold"
@@ -388,9 +411,8 @@ class FiringController:
                 cmd.trigger_action = "release"
                 state.is_trigger_held = False
                 state.firing_phase = FiringPhase.COOLDOWN
-                episode.cooldown_until = now + 0.350
+                episode.cooldown_until = now + 0.350 + random.uniform(-0.030, 0.040)
                 episode.active = False
-                state.reset_spray()
         else:
             if state.is_trigger_held:
                 cmd.trigger_action = "hold"
@@ -415,12 +437,15 @@ class FiringController:
             base_dx, base_dy = pattern[-1]
 
         skill = max(0.2, min(1.0, p.recoil_skill))
-        # Recoil drift / bias
-        self._recoil_bias_x += random.gauss(0, 0.05)
-        self._recoil_bias_x *= 0.90
+        # Recoil drift / bias (random walk with mean reversion)
+        self._recoil_bias_x = self._recoil_bias_x * 0.88 + random.gauss(0, 0.05)
+        self._recoil_bias_y = self._recoil_bias_y * 0.88 + random.gauss(0, 0.04)
+        # Bounded compensation jitter proportional to (1.0 - skill)
+        jitter_x = random.gauss(0, (1.0 - skill) * 0.5)
+        jitter_y = random.gauss(0, (1.0 - skill) * 0.3)
 
-        comp_dx = int(-base_dx * skill + self._recoil_bias_x)
-        comp_dy = int(-base_dy * skill)
+        comp_dx = int(round(-base_dx * skill + self._recoil_bias_x + jitter_x))
+        comp_dy = int(round(-base_dy * skill + self._recoil_bias_y + jitter_y))
 
         cmd.recoil_dx = comp_dx
         cmd.recoil_dy = comp_dy

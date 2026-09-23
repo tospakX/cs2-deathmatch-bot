@@ -489,7 +489,6 @@ class Bot:
         if self._is_firing:
             mouse.mouse_up("left")
             self._is_firing = False
-            self.player_state.reset_spray()
 
     def _roam(self, frame, keybinds: dict) -> None:
         """Roaming movement with a unified minimap anti-stick for any driver."""
@@ -524,18 +523,20 @@ class Bot:
         self._apply_move(cmd, keybinds)
 
     def _apply_move(self, cmd: dict, keybinds: dict) -> None:
-        """Execute a movement command (held keys + smoothed view turn)."""
-        self._release_all_movement()
-        for flag, bind in (
-            ("forward", "forward"),
-            ("back", "back"),
-            ("left", "left"),
-            ("right", "right"),
-            ("crouch", "crouch"),
-        ):
-            if cmd.get(flag):
-                keyboard.hold_key(keybinds[bind])
-                self._movement_keys_held.add(keybinds[bind])
+        """Execute a movement command with stateful key holding and smoothed view turn."""
+        for flag in ("forward", "back", "left", "right", "crouch"):
+            bind_key = keybinds.get(flag)
+            if not bind_key:
+                continue
+            should_hold = bool(cmd.get(flag, False))
+            is_held = bind_key in self._movement_keys_held
+            if should_hold and not is_held:
+                keyboard.hold_key(bind_key)
+                self._movement_keys_held.add(bind_key)
+            elif not should_hold and is_held:
+                keyboard.release_key(bind_key)
+                self._movement_keys_held.discard(bind_key)
+
         turn = self._smooth_turn(int(cmd.get("turn_x", 0)))
         if turn != 0:
             mouse.move_relative(turn, 0)
@@ -555,6 +556,7 @@ class Bot:
         """Clean shutdown."""
         print("[Bot] Shutting down...")
         self._stop_firing()
+        self.player_state.reset_spray()
         self._release_all_movement()
         keyboard.release_all()
         self.capture.stop()

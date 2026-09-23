@@ -80,6 +80,15 @@ class MovementPhase(Enum):
     PAUSING = auto()
 
 
+class TargetStatus(Enum):
+    """Visibility and tracking status of an observed target."""
+
+    VISIBLE = auto()
+    BRIEFLY_LOST = auto()
+    REACQUIRING = auto()
+    FORGOTTEN = auto()
+
+
 # ── Action / Episode records ──────────────────────────────────────────────────
 
 
@@ -114,6 +123,7 @@ class MotorEpisode:
     correction_duration: float = 0.0
     correction_vector: tuple[float, float] = (0.0, 0.0)
     accepted_error_px: float = 12.0
+    traversed_fraction: float = 0.0
 
 
 @dataclass
@@ -127,6 +137,8 @@ class FiringEpisode:
     shots_fired: int = 0
     pause_until: float = 0.0
     cooldown_until: float = 0.0
+    trigger_hold_duration: float = 0.0
+    press_time: float = 0.0
 
 
 @dataclass
@@ -192,6 +204,7 @@ class TrackedTarget:
         0.2,
     )  # Relative (x, y) offset within detection bbox
     initial_error_dist: float = 0.0
+    status: TargetStatus = TargetStatus.VISIBLE
 
     def update_position(self, cx: float, cy: float, now: float) -> None:
         """Record a new position observation."""
@@ -199,6 +212,7 @@ class TrackedTarget:
         self.last_seen = now
         self.frames_visible += 1
         self.frames_missing = 0
+        self.status = TargetStatus.VISIBLE
 
         # Estimate velocity from recent positions (screen pixels / second)
         if len(self.position_history) >= 3:
@@ -219,6 +233,12 @@ class TrackedTarget:
         """Target not detected this frame."""
         self.frames_missing += 1
         self.frames_visible = 0
+        if self.frames_missing <= 4:
+            self.status = TargetStatus.BRIEFLY_LOST
+        elif self.frames_missing <= 15:
+            self.status = TargetStatus.REACQUIRING
+        else:
+            self.status = TargetStatus.FORGOTTEN
 
 
 # ── Core player state ────────────────────────────────────────────────────────
