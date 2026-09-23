@@ -1,10 +1,11 @@
 """Attention-driven, purposeful camera scanning and looking behavior.
 
 Replaces fixed-duration generic look-arounds and random number generators with:
-- Checking last seen enemy positions when combat suddenly breaks
+- Checking angular spatial memories with velocity extrapolation and uncertainty growth
 - Checking unverified corners/chokepoints with smooth deceleration and observation pauses
 - Correlating look direction with movement heading and uncertainty
 - Natural head/camera glances shaped by personality scanning style
+- Invariant to screen-coordinate fallbacks: strictly uses relative angular space
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ if TYPE_CHECKING:
 class ScanAction:
     """An intentional camera scan with a specific reason and duration."""
 
-    reason: str  # "check_spatial_memory", "check_last_seen", "check_corner", "curiosity_glance"
+    reason: str  # "check_spatial_memory", "check_corner", "curiosity_glance"
     target_dx: float  # total mouse delta to sweep
     target_dy: float
     duration: float  # total duration in seconds
@@ -66,6 +67,14 @@ class ScanningController:
         now = state.now
         p = self.personality
 
+        # ── 0. Advance spatial memories with velocity extrapolation & uncertainty ──
+        state.advance_spatial_memories(
+            state.tick_dt,
+            fov_h=self.fov_h,
+            screen_w=self.screen_w,
+            screen_h=self.screen_h,
+        )
+
         # If in active combat engagement with a visible target, scanning is suppressed
         if (
             state.primary_target is not None
@@ -75,7 +84,7 @@ class ScanningController:
             self._current_scan = None
             return (0.0, 0.0)
 
-        # ── 1. If currently executing a scan ──────────────────────────────────
+        # ── 1. If currently executing an active scan ─────────────────────────
         if self._current_scan is not None:
             scan = self._current_scan
             elapsed = now - scan.start_time
@@ -84,7 +93,7 @@ class ScanningController:
                 # Active sweep phase: use smoothstep bell-curve velocity
                 t = elapsed / max(scan.duration, 0.001)
                 velocity_weight = 6.0 * t * (1.0 - t)
-                tick_factor = state.tick_dt / scan.duration
+                tick_factor = state.tick_dt / max(scan.duration, 0.001)
                 dx = scan.target_dx * velocity_weight * tick_factor
                 dy = scan.target_dy * velocity_weight * tick_factor
                 return (dx, dy)
@@ -102,19 +111,29 @@ class ScanningController:
         if now - self._last_scan_end < self._scan_cooldown:
             return (0.0, 0.0)
 
-        # Priority A: Check directional angular spatial memory with temporal decay
-        valid_memories = [m for m in state.spatial_memories if (now - m.last_seen_time) < 6.0]
+        # Priority A: Check directional angular spatial memory with velocity extrapolation
+        valid_memories = [
+            m
+            for m in state.spatial_memories
+            if (now - m.last_seen_time) < 6.0 and (m.confidence * m.decay_factor) >= 0.10
+        ]
         if valid_memories:
-            mem = valid_memories[-1]
-            state.spatial_memories.remove(mem)
-            age = now - mem.last_seen_time
+            # Score by confidence and freshness, penalized by uncertainty
+            best_mem = max(
+                valid_memories,
+                key=lambda m: (m.confidence * m.decay_factor) / max(0.5, m.uncertainty_deg),
+            )
+            try:
+                state.spatial_memories.remove(best_mem)
+            except ValueError:
+                pass
 
-            # Uncertainty jitter proportional to elapsed time (memory decay)
-            uncert_yaw = random.gauss(0, age * 1.5)
-            uncert_pitch = random.gauss(0, age * 0.8)
+            # Uncertainty jitter proportional to accumulated angular uncertainty
+            uncert_yaw = random.gauss(0, best_mem.uncertainty_deg * 0.35)
+            uncert_pitch = random.gauss(0, best_mem.uncertainty_deg * 0.20)
 
-            yaw_deg = mem.yaw_offset_deg + uncert_yaw
-            pitch_deg = mem.pitch_offset_deg + uncert_pitch
+            yaw_deg = best_mem.yaw_offset_deg + uncert_yaw
+            pitch_deg = best_mem.pitch_offset_deg + uncert_pitch
 
             # Convert angular offsets to mouse counts
             deg_per_count_x = self.m_yaw * self.sensitivity
@@ -125,18 +144,18 @@ class ScanningController:
             dist_counts = math.hypot(mouse_dx, mouse_dy)
             if dist_counts > 25.0:
                 duration = random.uniform(0.20, 0.38)
-                pause = random.uniform(0.25, 0.50)
+                pause = random.uniform(0.22, 0.48)
                 self._current_scan = ScanAction(
                     reason="check_spatial_memory",
-                    target_dx=mouse_dx * 0.75,
-                    target_dy=mouse_dy * 0.50,
+                    target_dx=mouse_dx * 0.80,
+                    target_dy=mouse_dy * 0.55,
                     duration=duration,
                     settle_pause=pause,
                     start_time=now,
                 )
                 return (0.0, 0.0)
 
-        # Priority B: Fallback to last seen screen positions
+        # Priority B: Check last seen enemy positions
         if state.last_enemy_positions:
             last_x, last_y, last_t = state.last_enemy_positions[-1]
             if now - last_t < 4.0:

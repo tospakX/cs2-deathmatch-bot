@@ -2,7 +2,7 @@
 
 Models human-like combat footwork:
 - Direction commitment with momentum and history (no mechanical left-right-left-right flipping)
-- Counter-strafing as a single transition event (moving -> braking -> stopped)
+- Explicit CounterStrafeState lifecycle machine: INACTIVE -> BRAKING -> SETTLED -> INACTIVE
 - Contextual combat movement:
     * Approaching: closing distance when weapon or situation favors it
     * Holding: holding position when holding an angle or burst-firing
@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import random
 from collections import deque
+from dataclasses import dataclass
+from enum import Enum, auto
 from typing import TYPE_CHECKING
 
 from src.behavior.player_state import MovementPhase
@@ -24,24 +26,88 @@ if TYPE_CHECKING:
     from src.behavior.player_state import PlayerState, TrackedTarget
 
 
+class CounterStrafeState(Enum):
+    """Lifecycle state of a counter-strafe maneuver."""
+
+    INACTIVE = auto()
+    BRAKING = auto()  # Counter-strafe key pressed to kill velocity (~60-80ms)
+    SETTLED = auto()  # Lateral velocity dead, settling pause before next move (~25-45ms)
+
+
+@dataclass
+class MovementEpisode:
+    """Persistent movement footwork episode."""
+
+    active: bool = False
+    phase: MovementPhase = MovementPhase.STATIONARY
+    direction: str = ""  # "left", "right", "forward", "back"
+    start_time: float = 0.0
+    duration: float = 0.0
+    same_dir_streak: int = 0
+    braking_done: bool = False
+
+
 class MovementController:
     """Manages continuous stateful movement during combat and roaming."""
 
     def __init__(self, personality: PersonalityTraits):
         self.personality = personality
+        self.episode = MovementEpisode()
         self._current_phase: MovementPhase = MovementPhase.STATIONARY
         self._phase_start: float = 0.0
         self._phase_duration: float = 0.0
         self._current_direction: str = ""  # "left", "right", "forward", "back"
 
-        # Direction history to prevent algorithmic alternation
-        self._direction_history: deque[str] = deque(maxlen=8)
+        # Direction history and streak tracking
+        self._direction_history: deque[str] = deque(maxlen=10)
+        self._same_dir_streak: int = 0
 
-        # Counter-strafing state (single-transition braking)
-        self._counter_strafing: bool = False
+        # Counter-strafing explicit lifecycle state machine
+        self._cs_state: CounterStrafeState = CounterStrafeState.INACTIVE
         self._counter_strafe_end: float = 0.0
+        self._counter_strafe_settle_end: float = 0.0
         self._counter_strafe_key: str = ""
         self._braking_done_for_movement: bool = False
+
+    @property
+    def _counter_strafing(self) -> bool:
+        return self._cs_state == CounterStrafeState.BRAKING
+
+    @_counter_strafing.setter
+    def _counter_strafing(self, value: bool) -> None:
+        if value:
+            self._cs_state = CounterStrafeState.BRAKING
+        else:
+            self._cs_state = CounterStrafeState.INACTIVE
+
+    @property
+    def is_settled(self) -> bool:
+        """True if player is counter-strafed and settled with zero lateral velocity."""
+        return self._cs_state in (
+            CounterStrafeState.SETTLED,
+            CounterStrafeState.INACTIVE,
+        ) and self._current_phase in (
+            MovementPhase.HOLDING,
+            MovementPhase.STATIONARY,
+        )
+
+    def check_lifecycle(self, now: float) -> tuple[dict[str, bool], bool]:
+        """High-cadence check for counter-strafe impulse & settle transitions.
+
+        Called between 30Hz frames to release braking key at the exact planned millisecond.
+        Returns:
+            (key_changes, state_changed)
+        """
+        if self._cs_state == CounterStrafeState.BRAKING:
+            if now >= self._counter_strafe_end:
+                self._cs_state = CounterStrafeState.SETTLED
+                # Return instruction to release braking key immediately
+                return {self._counter_strafe_key: False}, True
+        elif self._cs_state == CounterStrafeState.SETTLED:
+            if now >= self._counter_strafe_settle_end:
+                self._cs_state = CounterStrafeState.INACTIVE
+                return {}, True
+        return {}, False
 
     def update(
         self,
@@ -61,16 +127,21 @@ class MovementController:
             "walk": False,
         }
 
-        # ── 1. Counter-strafing Braking Execution ────────────────────────────
-        # When stopping to shoot, press opposite key for ~60-80ms to kill lateral velocity
-        if self._counter_strafing:
+        # ── 1. Counter-strafing State Machine Execution ──────────────────────
+        if self._cs_state == CounterStrafeState.BRAKING:
             if now < self._counter_strafe_end:
                 if self._counter_strafe_key in keys:
                     keys[self._counter_strafe_key] = True
                 return keys
             else:
-                self._counter_strafing = False
-                # Braking is finished, player is now settled
+                self._cs_state = CounterStrafeState.SETTLED
+
+        if self._cs_state == CounterStrafeState.SETTLED:
+            if now < self._counter_strafe_settle_end:
+                # Settling window: stationary, dead stop for 100% first-shot accuracy
+                return keys
+            else:
+                self._cs_state = CounterStrafeState.INACTIVE
 
         # ── 2. Determine / transition movement phase ─────────────────────────
         phase_elapsed = now - self._phase_start
@@ -130,6 +201,8 @@ class MovementController:
 
         state.movement_phase = self._current_phase
         state.movement_direction = self._current_direction
+        self.episode.phase = self._current_phase
+        self.episode.direction = self._current_direction
         return keys
 
     def _select_combat_phase(
@@ -175,22 +248,35 @@ class MovementController:
                 self._transition_to(MovementPhase.STRAFING, now, random.uniform(0.30, 0.55))
 
     def _sample_next_direction(self) -> str:
-        """Sample next strafe direction based on history (not simple alternation)."""
+        """Sample next strafe direction based on streak momentum and history."""
         last_dir = self._direction_history[-1] if self._direction_history else ""
 
         if not last_dir or last_dir not in ("left", "right"):
             chosen = random.choice(["left", "right"])
+            self._same_dir_streak = 1
         else:
-            # Human movement continuity:
-            # ~40% reverse, ~35% repeat (double-strafe), ~25% short pause
-            roll = random.random()
             opposite = "right" if last_dir == "left" else "left"
-            if roll < 0.55:
-                chosen = opposite
+            roll = random.random()
+            # Streak-dependent momentum:
+            # streak 1: ~35% repeat (double strafe), ~65% reverse
+            # streak 2: ~15% repeat, ~85% reverse
+            # streak >= 3: ~5% repeat, ~95% reverse
+            if self._same_dir_streak <= 1:
+                repeat_prob = 0.35
+            elif self._same_dir_streak == 2:
+                repeat_prob = 0.15
             else:
+                repeat_prob = 0.05
+
+            if roll < repeat_prob:
                 chosen = last_dir
+                self._same_dir_streak += 1
+            else:
+                chosen = opposite
+                self._same_dir_streak = 1
 
         self._direction_history.append(chosen)
+        self.episode.same_dir_streak = self._same_dir_streak
         return chosen
 
     def _select_roam_phase(self, state: PlayerState, now: float) -> None:
@@ -201,12 +287,16 @@ class MovementController:
         """Initiate single counter-strafe braking event."""
         opposite = {"left": "right", "right": "left", "forward": "back", "back": "forward"}
         opp_key = opposite.get(moving_direction, "")
-        if opp_key and not self._counter_strafing:
-            self._counter_strafing = True
+        if opp_key and self._cs_state == CounterStrafeState.INACTIVE:
+            self._cs_state = CounterStrafeState.BRAKING
             # CS2 counter-strafe impulse is ~60-80ms
             self._counter_strafe_end = now + random.uniform(0.060, 0.080)
+            self._counter_strafe_settle_end = self._counter_strafe_end + random.uniform(
+                0.025, 0.045
+            )
             self._counter_strafe_key = opp_key
             self._braking_done_for_movement = True
+            self.episode.braking_done = True
 
     def _transition_to(self, new_phase: MovementPhase, now: float, duration: float) -> None:
         """Transition movement state and reset braking state for the new movement."""
@@ -214,3 +304,7 @@ class MovementController:
         self._phase_start = now
         self._phase_duration = duration
         self._braking_done_for_movement = False
+        self.episode.phase = new_phase
+        self.episode.start_time = now
+        self.episode.duration = duration
+        self.episode.braking_done = False

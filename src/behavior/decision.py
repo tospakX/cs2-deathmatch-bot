@@ -15,7 +15,7 @@ from src.behavior.adaptation import AdaptationEngine
 from src.behavior.attention import AttentionSystem
 from src.behavior.firing import FiringCommand, FiringController
 from src.behavior.movement import MovementController
-from src.behavior.player_state import AimPhase, AuthoritativeAim, BotPhase
+from src.behavior.player_state import AimPhase, AuthoritativeAim, BotPhase, TargetStatus
 from src.behavior.reaction import ReactionSystem
 from src.behavior.scanning import ScanningController
 from src.utils.math_helpers import screen_delta_to_mouse
@@ -134,7 +134,7 @@ class DecisionEngine:
         self.reaction.update(state)
 
         # ── 4. Authoritative Aim State (Calculated ONCE per tick) ────────────
-        if target is not None:
+        if target is not None and target.status == TargetStatus.VISIBLE:
             # Select aim preference once upon acquisition (never reroll per frame!)
             if not target.aim_preference:
                 head_choice = random.random() < p.head_aim_preference
@@ -175,8 +175,12 @@ class DecisionEngine:
             )
             state.current_aim_error = (err_x, err_y)
         else:
-            state.authoritative_aim = AuthoritativeAim()
+            state.authoritative_aim = AuthoritativeAim(is_valid=False)
             state.current_aim_error = (0.0, 0.0)
+            if target is not None:
+                # Target is not currently visible (BRIEFLY_LOST / REACQUIRING)
+                if state.aim_phase in (AimPhase.ACQUIRING, AimPhase.CORRECTING, AimPhase.TRACKING):
+                    state.aim_phase = AimPhase.REACQUIRING
 
         # ── 5. Adaptation update ─────────────────────────────────────────────
         self.adaptation.update(state)
@@ -216,14 +220,22 @@ class DecisionEngine:
 
         # ── 7. High-level Phase determination ────────────────────────────────
         if not reload_ep.is_reloading:
-            if target is not None:
+            if target is not None and target.status == TargetStatus.VISIBLE:
                 if state.health <= p.disengage_health:
                     state.transition_phase(BotPhase.RETREATING)
                     action_type = "retreat"
                 else:
                     state.transition_phase(BotPhase.ENGAGING)
                     action_type = "engage"
-            elif state.last_enemy_positions and (now - state.last_enemy_positions[-1][2] < 3.0):
+            elif target is not None and target.status in (
+                TargetStatus.BRIEFLY_LOST,
+                TargetStatus.REACQUIRING,
+            ):
+                state.transition_phase(BotPhase.SCANNING)
+                action_type = "search"
+            elif state.spatial_memories or (
+                state.last_enemy_positions and (now - state.last_enemy_positions[-1][2] < 3.0)
+            ):
                 state.transition_phase(BotPhase.SCANNING)
                 action_type = "search"
             else:
@@ -232,9 +244,13 @@ class DecisionEngine:
 
         # ── 8. Firing plan (Consumes Authoritative Aim State) ─────────────────
         firing_cmd = FiringCommand()
-        if not reload_ep.is_reloading:
+        if not reload_ep.is_reloading and state.authoritative_aim.is_valid:
             err_dist = state.authoritative_aim.screen_error_dist
             firing_cmd = self.firing.update(state, target, err_dist)
+        else:
+            if state.firing_episode.active:
+                state.firing_episode.active = False
+            state.is_trigger_held = False
 
         # ── 9. Movement plan ─────────────────────────────────────────────────
         move_keys = self.movement.update(state, target, firing_cmd.is_firing)
@@ -243,7 +259,7 @@ class DecisionEngine:
 
         # ── 10. Scanning / looking plan ──────────────────────────────────────
         scan_delta = (0.0, 0.0)
-        if target is None and not reload_ep.is_reloading:
+        if (target is None or target.status != TargetStatus.VISIBLE) and not reload_ep.is_reloading:
             scan_delta = self.scanning.update(state)
 
         # ── 11. Idle quirks ──────────────────────────────────────────────────

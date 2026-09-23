@@ -31,6 +31,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 from src.behavior.decision import DecisionEngine
+from src.behavior.executor import MotorExecutor
 from src.behavior.motor import MotorPlanner
 from src.behavior.perception import PerceptionSystem
 from src.behavior.personality import load_personality
@@ -137,6 +138,15 @@ class Bot:
             screen_width=display["width"],
             screen_height=display["height"],
             personality=self.personality,
+        )
+        self.motor_executor = MotorExecutor(
+            player_state=self.player_state,
+            motor_planner=self.motor_planner,
+            firing_controller=self.decision_engine.firing,
+            movement_controller=self.decision_engine.movement,
+            mouse_backend=mouse,
+            keyboard_backend=keyboard,
+            keybinds=self.config["keybinds"],
         )
 
         # State machine bridge for debug overlay & metrics
@@ -415,11 +425,10 @@ class Bot:
                 if not self.debug.show(vis):
                     self.running = False
 
-            # 10. Sleep remainder of tick
-            elapsed = time.perf_counter() - tick_start
-            sleep_time = tick_interval - elapsed
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+            # 10. High-cadence sub-step execution through remainder of tick
+            tick_end = tick_start + tick_interval
+            if time.perf_counter() < tick_end:
+                self.motor_executor.run_substeps_until(tick_end)
 
     def _execute_behavior(self, decision, frame) -> None:
         """Execute the planned actions from the authoritative behavioral engine."""
@@ -442,6 +451,9 @@ class Bot:
         # Apply continuous mouse movement (SendInput, non-blocking)
         if mouse_dx != 0 or mouse_dy != 0:
             mouse.move_relative(mouse_dx, mouse_dy)
+            yaw_deg = mouse_dx * self.motor_planner.m_yaw * self.motor_planner.sensitivity
+            pitch_deg = mouse_dy * self.motor_planner.m_pitch * self.motor_planner.sensitivity
+            self.player_state.on_camera_rotated(yaw_deg, pitch_deg)
 
         # 3. Firing execution (synchronized with trigger events)
         if decision.firing_cmd.trigger_action == "press":

@@ -8,8 +8,7 @@ Nothing here is reset every frame. Resets happen only on death/respawn
 or explicit state transitions.
 """
 
-from __future__ import annotations
-
+import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -110,20 +109,27 @@ class MotorEpisode:
     """Persistent motor plan for an acquisition / correction episode."""
 
     active: bool = False
+    target_id: int = -1
     start_time: float = 0.0
     duration: float = 0.0
     start_error_counts: tuple[float, float] = (0.0, 0.0)
     target_displacement_counts: tuple[float, float] = (0.0, 0.0)
+    traversed_fraction: float = 0.0
     phase: str = (
         "idle"  # "primary", "decelerating", "evaluating", "corrective", "settling", "pursuit"
     )
+    trajectory_shape: str = "minimum_jerk"
+    peak_velocity: float = 0.0  # planned peak velocity in mouse counts/s
+    deceleration_point: float = 0.50  # normalized tau where deceleration begins
     submovements_planned: int = 1
     submovements_completed: int = 0
     correction_start_time: float = 0.0
     correction_duration: float = 0.0
     correction_vector: tuple[float, float] = (0.0, 0.0)
     accepted_error_px: float = 12.0
-    traversed_fraction: float = 0.0
+    abort_threshold_px: float = 180.0
+    completed: bool = False
+    aborted: bool = False
 
 
 @dataclass
@@ -166,13 +172,40 @@ class ReloadEpisode:
 class SpatialMemory:
     """Persistent directional memory of an enemy with true last_seen timestamp."""
 
-    screen_x: float
-    screen_y: float
-    yaw_offset_deg: float
-    pitch_offset_deg: float
+    screen_x: float  # Historical screen pixel reference (diagnostic/reference only)
+    screen_y: float  # Historical screen pixel reference (diagnostic/reference only)
+    yaw_offset_deg: float  # Current angular yaw offset relative to camera view
+    pitch_offset_deg: float  # Current angular pitch offset relative to camera view
     last_seen_time: float
     confidence: float
-    velocity: tuple[float, float] = (0.0, 0.0)
+    velocity: tuple[float, float] = (0.0, 0.0)  # Screen px/s estimated velocity
+    uncertainty_deg: float = 1.0  # Grows with time elapsed since observation
+    decay_factor: float = 1.0  # Decays exponentially with age
+
+    def update_camera_rotation(self, yaw_delta_deg: float, pitch_delta_deg: float) -> None:
+        """Update relative angular offset when camera rotates."""
+        self.yaw_offset_deg -= yaw_delta_deg
+        self.pitch_offset_deg -= pitch_delta_deg
+
+    def advance_time(
+        self,
+        dt: float,
+        current_time: float,
+        fov_h: float = 122.0,
+        screen_w: int = 3440,
+        screen_h: int = 1440,
+    ) -> None:
+        """Advance time: extrapolate target velocity, grow uncertainty, and decay confidence."""
+        age = current_time - self.last_seen_time
+        aspect = screen_w / max(1.0, float(screen_h))
+        fov_v = 2.0 * math.degrees(math.atan(math.tan(math.radians(fov_h / 2.0)) / aspect))
+        vx_px_s, vy_px_s = self.velocity
+        yaw_vel = (vx_px_s / max(1.0, float(screen_w))) * fov_h
+        pitch_vel = (vy_px_s / max(1.0, float(screen_h))) * fov_v
+        self.yaw_offset_deg += yaw_vel * dt
+        self.pitch_offset_deg += pitch_vel * dt
+        self.uncertainty_deg = 1.0 + age * 2.0
+        self.decay_factor = math.exp(-age / 3.0)
 
 
 # ── Target record ────────────────────────────────────────────────────────────
@@ -479,3 +512,30 @@ class PlayerState:
             self.recent_kills.append(self._now)
         else:
             self.confidence = max(0.1, self.confidence - 0.03)
+
+    # ── Camera & Spatial Memory Tracking ─────────────────────────────────
+
+    def on_camera_rotated(self, yaw_delta_deg: float, pitch_delta_deg: float) -> None:
+        """Update angular offsets of stored spatial memories when camera rotates."""
+        for mem in self.spatial_memories:
+            mem.update_camera_rotation(yaw_delta_deg, pitch_delta_deg)
+
+    def advance_spatial_memories(
+        self,
+        dt: float,
+        fov_h: float = 122.0,
+        screen_w: int = 3440,
+        screen_h: int = 1440,
+    ) -> None:
+        """Advance time for all active spatial memories."""
+        to_prune = []
+        for mem in self.spatial_memories:
+            mem.advance_time(dt, self._now, fov_h, screen_w, screen_h)
+            # Prune if too old or too decayed
+            if (self._now - mem.last_seen_time > 8.0) or (mem.confidence * mem.decay_factor < 0.12):
+                to_prune.append(mem)
+        for m in to_prune:
+            try:
+                self.spatial_memories.remove(m)
+            except ValueError:
+                pass

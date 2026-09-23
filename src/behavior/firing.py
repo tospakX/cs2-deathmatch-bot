@@ -165,6 +165,26 @@ class FiringController:
         state.reset_spray()
         state.firing_episode.active = False
 
+    def check_trigger_release(self, state: PlayerState, now: float) -> bool:
+        """Check if held trigger should be released between 30Hz decision ticks.
+
+        Returns True if trigger was released.
+        """
+        if not state.is_trigger_held:
+            return False
+        episode = state.firing_episode
+        if episode.active and episode.mode == "tap":
+            if (now - episode.press_time) >= episode.trigger_hold_duration:
+                state.is_trigger_held = False
+                state.firing_phase = FiringPhase.BURST_PAUSE
+                episode.active = False
+                tap_interval = self.cycle_time + (
+                    0.080 + (1.0 - self.personality.firing_discipline) * 0.120
+                )
+                episode.pause_until = now + tap_interval
+                return True
+        return False
+
     def update(
         self,
         state: PlayerState,

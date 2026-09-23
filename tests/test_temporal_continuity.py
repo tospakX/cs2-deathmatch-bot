@@ -20,9 +20,10 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.behavior.decision import DecisionEngine
+from src.behavior.executor import MotorExecutor
 from src.behavior.firing import RECOIL_RESET_TIME, FiringController
 from src.behavior.motor import MotorPlanner
-from src.behavior.movement import MovementController
+from src.behavior.movement import CounterStrafeState, MovementController
 from src.behavior.perception import PerceptionSystem, hungarian_assignment
 from src.behavior.personality import PersonalityTraits
 from src.behavior.player_state import (
@@ -572,3 +573,236 @@ def test_recoil_cooldown_not_prematurely_reset():
     state._now = 10.0 + RECOIL_RESET_TIME * 1.1
     firing.update(state, None)
     assert state.recoil_shot_index == 0
+
+
+# ── 17. Plan-first Motor Episode Parameters & Trajectory Isolation ───────────
+
+
+def test_plan_first_motor_episode_explicit_parameters():
+    """MotorEpisode stores complete planned trajectory parameters upon initiation."""
+    p = PersonalityTraits(motor_speed=0.9, motor_precision=0.8)
+    planner = MotorPlanner(
+        screen_center=(1720, 720),
+        sensitivity=1.0,
+        m_yaw=0.022,
+        m_pitch=0.022,
+        fov_h=90.0,
+        screen_width=3440,
+        screen_height=1440,
+        personality=p,
+    )
+    state = PlayerState()
+    state.is_alive = True
+    state.aim_phase = AimPhase.ACQUIRING
+
+    # Distant target at (1920, 720) -> 200px error
+    det = make_det(1920, 720)
+    target = TrackedTarget(detection=det, target_id=42, frames_visible=5)
+    state.primary_target = target
+
+    dx, dy = planner.plan(state)
+    ep = state.motor_episode
+
+    assert ep.active is True
+    assert ep.target_id == 42
+    assert ep.duration >= 0.066
+    assert ep.trajectory_shape == "minimum_jerk"
+    assert ep.deceleration_point == 0.50
+    assert ep.submovements_planned in (1, 2)
+    assert ep.abort_threshold_px >= 180.0
+    assert ep.peak_velocity > 0.0
+    assert ep.traversed_fraction > 0.0
+    assert ep.completed is False
+    assert ep.aborted is False
+
+
+# ── 18. Authoritative Aim Gating on Target Visibility ─────────────────────────
+
+
+def test_authoritative_aim_gating_on_target_visibility_stops_firing():
+    """When target is lost/missing, AuthoritativeAim.is_valid is False and firing stops."""
+    p = PersonalityTraits(firing_discipline=0.9)
+    engine = DecisionEngine(personality=p, screen_center=(1720, 720))
+    state = PlayerState()
+    state.is_alive = True
+
+    det = make_det(1725, 720, w=40, h=80)
+    target = TrackedTarget(detection=det, target_id=7, frames_visible=10)
+
+    # Frame 1: Target visible -> valid authoritative aim
+    dec1 = engine.decide(state, [target])
+    assert state.authoritative_aim.is_valid is True
+    assert state.authoritative_aim.target_id == 7
+    assert dec1.phase == BotPhase.ENGAGING
+
+    # Target occluded / missing -> mark missing
+    target.mark_missing()
+    assert target.status == TargetStatus.BRIEFLY_LOST
+
+    # Frame 2: Target not visible -> is_valid must be False, firing stops
+    state.aim_phase = AimPhase.TRACKING
+    state._now += 0.033
+    state.is_trigger_held = True
+    state.firing_episode.active = True
+    dec2 = engine.decide(state, [target])
+
+    assert state.authoritative_aim.is_valid is False
+    assert state.authoritative_aim.motor_error == (0.0, 0.0)
+    assert state.is_trigger_held is False
+    assert state.firing_episode.active is False
+    assert dec2.firing_cmd.is_firing is False
+    assert state.aim_phase == AimPhase.REACQUIRING
+
+
+# ── 19. Camera Rotation Anchors Spatial Memory ────────────────────────────────
+
+
+def test_spatial_memory_camera_rotation_and_velocity_extrapolation():
+    """SpatialMemory tracks relative angular offsets as camera rotates and extrapolates."""
+    import math
+
+    state = PlayerState()
+    state.is_alive = True
+    state._now = 100.0
+
+    mem = SpatialMemory(
+        screen_x=2000.0,
+        screen_y=720.0,
+        yaw_offset_deg=30.0,
+        pitch_offset_deg=-10.0,
+        last_seen_time=100.0,
+        confidence=0.9,
+        velocity=(200.0, 0.0),
+    )
+    state.spatial_memories.append(mem)
+
+    # Camera rotates yaw by +15 degrees (rightward) and pitch by -5 degrees (upward)
+    state.on_camera_rotated(yaw_delta_deg=15.0, pitch_delta_deg=-5.0)
+
+    # Relative angular offset from current camera center must decrease accordingly
+    assert math.isclose(mem.yaw_offset_deg, 15.0, abs_tol=1e-3)
+    assert math.isclose(mem.pitch_offset_deg, -5.0, abs_tol=1e-3)
+
+    # Advance time: uncertainty grows and confidence decays
+    state._now = 101.5
+    state.advance_spatial_memories(dt=1.5)
+
+    assert mem.uncertainty_deg > 1.0
+    assert mem.decay_factor < 1.0
+
+
+# ── 20. Counter-Strafe Lifecycle State Machine ────────────────────────────────
+
+
+def test_counter_strafe_lifecycle_state_machine():
+    """CounterStrafe transitions from INACTIVE -> BRAKING -> SETTLED -> INACTIVE."""
+    p = PersonalityTraits(strafe_tendency=0.3)
+    movement = MovementController(personality=p)
+    state = PlayerState()
+    state.is_alive = True
+    state._now = 50.0
+
+    det = make_det(1720, 720)
+    target = TrackedTarget(detection=det, target_id=9, frames_visible=10)
+
+    movement._current_phase = MovementPhase.STRAFING
+    movement._current_direction = "left"
+    movement._phase_start = 50.0
+    movement._phase_duration = 0.50
+
+    # Start firing -> initiates BRAKING impulse
+    keys = movement.update(state, target, is_firing=True)
+    assert movement._cs_state == CounterStrafeState.BRAKING
+    assert movement._counter_strafe_key == "right"
+    assert keys["right"] is True
+
+    # High-cadence check before end of impulse: no change
+    changes, changed = movement.check_lifecycle(movement._counter_strafe_end - 0.010)
+    assert changed is False
+
+    # High-cadence check at end of impulse: releases braking key immediately -> SETTLED
+    changes, changed = movement.check_lifecycle(movement._counter_strafe_end + 0.002)
+    assert changed is True
+    assert changes == {"right": False}
+    assert movement._cs_state == CounterStrafeState.SETTLED
+
+    # High-cadence check after settle window -> INACTIVE
+    changes, changed = movement.check_lifecycle(movement._counter_strafe_settle_end + 0.002)
+    assert changed is True
+    assert movement._cs_state == CounterStrafeState.INACTIVE
+
+
+# ── 21. MotorExecutor High-Cadence Sub-Steps ──────────────────────────────────
+
+
+class DummyMouse:
+    def __init__(self):
+        self.moves = []
+        self.mouse_ups = []
+
+    def move_relative(self, dx, dy):
+        self.moves.append((dx, dy))
+
+    def mouse_up(self, btn):
+        self.mouse_ups.append(btn)
+
+
+class DummyKeyboard:
+    def __init__(self):
+        self.pressed = []
+        self.released = []
+
+    def key_down(self, k):
+        self.pressed.append(k)
+
+    def key_up(self, k):
+        self.released.append(k)
+
+
+def test_motor_executor_high_cadence_substeps():
+    """MotorExecutor executes trigger release and reaching sub-steps between 30Hz ticks."""
+    import time
+
+    p = PersonalityTraits(motor_speed=1.0, firing_discipline=0.8)
+    state = PlayerState()
+    state.is_alive = True
+    planner = MotorPlanner(
+        screen_center=(1720, 720),
+        sensitivity=1.0,
+        m_yaw=0.022,
+        m_pitch=0.022,
+        fov_h=90.0,
+        screen_width=3440,
+        screen_height=1440,
+        personality=p,
+    )
+    firing = FiringController(personality=p)
+    movement = MovementController(personality=p)
+    dummy_mouse = DummyMouse()
+    dummy_keyboard = DummyKeyboard()
+
+    executor = MotorExecutor(
+        player_state=state,
+        motor_planner=planner,
+        firing_controller=firing,
+        movement_controller=movement,
+        mouse_backend=dummy_mouse,
+        keyboard_backend=dummy_keyboard,
+        keybinds={"right": "d", "left": "a"},
+    )
+
+    # Configure a tap held that expires in 10ms
+    now = time.perf_counter()
+    state.is_trigger_held = True
+    state.firing_episode.active = True
+    state.firing_episode.mode = "tap"
+    state.firing_episode.press_time = now - 0.050
+    state.firing_episode.trigger_hold_duration = 0.055
+
+    # Run sub-steps for 15ms
+    end_time = now + 0.015
+    executor.run_substeps_until(end_time, min_sleep=0.001)
+
+    # Trigger must have been released by the high-cadence check
+    assert state.is_trigger_held is False
+    assert "left" in dummy_mouse.mouse_ups
