@@ -1,14 +1,20 @@
-"""Reaction time distributions and timing humanization."""
+"""Reaction time distributions and timing humanization with temporal continuity."""
+
+from __future__ import annotations
 
 import random
 import time
 
 
 class ReactionTimer:
-    """Generates human-like reaction times using normal distribution."""
+    """Generates human-like reaction times with temporal correlation."""
 
     def __init__(
-        self, mean_ms: float = 250, std_ms: float = 50, min_ms: float = 150, max_ms: float = 500
+        self,
+        mean_ms: float = 250.0,
+        std_ms: float = 50.0,
+        min_ms: float = 150.0,
+        max_ms: float = 500.0,
     ):
         self.mean_ms = mean_ms
         self.std_ms = std_ms
@@ -16,11 +22,18 @@ class ReactionTimer:
         self.max_ms = max_ms
         self._pending_reaction: float | None = None
         self._reaction_start: float = 0.0
+        # Short-term reaction tendency drifts slowly rather than jumping wildly
+        self._tendency: float = 1.0
 
-    def start_reaction(self) -> float:
-        """Start a new reaction timer. Returns the reaction delay in seconds."""
-        delay_ms = random.gauss(self.mean_ms, self.std_ms)
-        delay_ms = max(self.min_ms, min(self.max_ms, delay_ms))
+    def start_reaction(self, context_multiplier: float = 1.0) -> float:
+        """Start a new reaction timer with temporally correlated variation."""
+        # Slowly drift short-term tendency (random walk with mean reversion)
+        self._tendency += random.gauss(0, 0.03)
+        self._tendency += (1.0 - self._tendency) * 0.1
+        self._tendency = max(0.7, min(1.3, self._tendency))
+
+        base = random.gauss(self.mean_ms, self.std_ms) * self._tendency * context_multiplier
+        delay_ms = max(self.min_ms, min(self.max_ms, base))
         self._pending_reaction = delay_ms / 1000.0
         self._reaction_start = time.perf_counter()
         return self._pending_reaction
@@ -41,6 +54,10 @@ class ReactionTimer:
             return 0.0
         elapsed = time.perf_counter() - self._reaction_start
         return max(0.0, self._pending_reaction - elapsed)
+
+    def reset(self) -> None:
+        """Clear pending reaction."""
+        self._pending_reaction = None
 
 
 class ActionCooldown:

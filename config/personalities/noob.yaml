@@ -43,3 +43,8 @@ combat:
   disengage_health: 15          # Only runs when almost dead
   reload_threshold: 0.1         # Reloads way too late
   switch_target_delay_ms: 600   # Slow to switch targets
+
+scanning:
+  frequency: 0.2
+  amplitude: 0.8
+  hesitation_tendency: 0.6

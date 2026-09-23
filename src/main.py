@@ -26,9 +26,13 @@ sys.path.insert(0, PROJECT_ROOT)
 from src.aim.mouse_mover import MouseMover
 from src.aim.recoil import RecoilCompensator
 from src.aim.targeting import TargetingSystem
+from src.behavior.decision import DecisionEngine
+from src.behavior.motor import MotorPlanner
+from src.behavior.perception import PerceptionSystem
+from src.behavior.player_state import BotPhase, PlayerState
 from src.brain.decision import Action, DecisionMaker
 from src.brain.priorities import ThreatAssessor
-from src.brain.state_machine import StateMachine
+from src.brain.state_machine import BotState, StateMachine
 from src.capture.screen import ScreenCapture
 from src.humanizer.mistakes import MistakeMaker
 from src.humanizer.noise import NoiseGenerator
@@ -106,10 +110,29 @@ class Bot:
             val_min=mm.get("val_min", 190),
         )
 
-        # Brain
+        # Behavioral Core (Persistent simulated human player)
+        game = self.config["game"]
+        self.player_state = PlayerState()
+        self.perception = PerceptionSystem((game["crosshair_x"], game["crosshair_y"]))
+        self.decision_engine = DecisionEngine(
+            personality=self.personality,
+            screen_center=(game["crosshair_x"], game["crosshair_y"]),
+            weapon=game.get("weapon", "default"),
+        )
+        self.motor_planner = MotorPlanner(
+            screen_center=(game["crosshair_x"], game["crosshair_y"]),
+            sensitivity=game["sensitivity"],
+            m_yaw=game["m_yaw"],
+            m_pitch=game["m_pitch"],
+            fov_h=game.get("fov_horizontal", 122.0),
+            screen_width=display["width"],
+            screen_height=display["height"],
+            personality=self.personality,
+        )
+
+        # Brain & Aim bridges
         self.state_machine = StateMachine()
         self.decision_maker = DecisionMaker(self.personality)
-        game = self.config["game"]
         self.threat_assessor = ThreatAssessor((game["crosshair_x"], game["crosshair_y"]))
 
         # Aim
@@ -120,6 +143,9 @@ class Bot:
             game["m_yaw"],
             game["m_pitch"],
             self.personality.head_aim_chance,
+            fov_horizontal=game.get("fov_horizontal", 122.0),
+            screen_width=display["width"],
+            screen_height=display["height"],
         )
         self.mouse_mover = MouseMover(
             base_speed=self.personality.aim_speed,
@@ -336,37 +362,45 @@ class Bot:
             # 3. Read HUD
             hud = self.hud_reader.read(frame)
 
-            # 4. Check stuck.
+            # 4. Update persistent player state
+            self.player_state.begin_tick()
+            self.player_state.health = hud.health
+            self.player_state.ammo_clip = hud.ammo_clip
+            self.player_state.is_alive = hud.is_alive
+
+            # Check stuck
             is_moving = len(self._movement_keys_held) > 0
             self._is_stuck = self.stuck_detector.update(frame, is_moving)
-            # Stuck recovery lives in _roam now (minimap turn-sweep), so keep the
-            # legacy FSM out of STUCK entirely -- its backup-into-wall loop was
-            # what hijacked movement.
             is_stuck = False
 
-            # 5. Prioritize targets
-            enemies = self.threat_assessor.prioritize_targets(detections)
-
-            # 6. Update state machine
-            self.state_machine.update(
-                is_alive=hud.is_alive,
-                enemies_visible=len(enemies),
-                health=hud.health,
-                is_stuck=is_stuck,
-                disengage_health=self.personality.disengage_health,
+            # 5. Perception: track detected enemies across frames with persistent identity
+            self.perception.update(self.player_state, detections)
+            visible_targets = self.perception.get_visible_targets(self.player_state)
+            enemies = (
+                [t.detection for t in visible_targets]
+                if visible_targets
+                else [d for d in detections if not d.is_head]
             )
 
-            # 7. Make decision
-            action = self.decision_maker.decide(
-                state=self.state_machine.state,
-                enemies=enemies,
-                health=hud.health,
-                ammo_clip=hud.ammo_clip,
-                time_in_state=self.state_machine.time_in_state,
-            )
+            # 6. Decision Engine: attention, reaction, firing, movement, adaptation
+            decision = self.decision_engine.decide(self.player_state, visible_targets)
 
-            # 8. Execute action
-            self._execute_action(action, frame, enemies)
+            # Synchronize state_machine for debug overlay & session logging
+            phase_to_state = {
+                BotPhase.DEAD: BotState.DEAD,
+                BotPhase.ROAMING: BotState.ROAMING,
+                BotPhase.SCANNING: BotState.SEARCHING,
+                BotPhase.ENGAGING: BotState.FIGHTING,
+                BotPhase.TRACKING: BotState.FIGHTING,
+                BotPhase.RETREATING: BotState.RETREATING,
+                BotPhase.SPAWNING: BotState.ROAMING,
+            }
+            mapped_state = phase_to_state.get(self.player_state.phase, BotState.ROAMING)
+            self.state_machine.state = mapped_state
+            action = Action(decision.action_type)
+
+            # 7. Execute planned behavior (non-blocking motor + shot-based recoil + movement)
+            self._execute_behavior(decision, frame, enemies)
 
             # 8b. Session logging (cheap; throttled frame saves)
             if self.logger.enabled:
@@ -419,6 +453,67 @@ class Bot:
             sleep_time = tick_interval - elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
+
+    def _execute_behavior(self, decision, frame, enemies: list[Detection]) -> None:
+        """Execute the planned actions from the behavioral engine."""
+        keybinds = self.config["keybinds"]
+
+        # 1. Non-blocking continuous motor planning (mouse aiming)
+        mouse_dx, mouse_dy = (0, 0)
+        if decision.target is not None:
+            mouse_dx, mouse_dy = self.motor_planner.plan(self.player_state)
+        elif decision.scan_delta != (0.0, 0.0):
+            mouse_dx, mouse_dy = self.motor_planner.plan_scan(
+                decision.scan_delta[0], decision.scan_delta[1], self.player_state
+            )
+
+        # 2. Shot-based recoil compensation
+        if decision.firing_cmd.recoil_dx != 0 or decision.firing_cmd.recoil_dy != 0:
+            mouse_dx += decision.firing_cmd.recoil_dx
+            mouse_dy += decision.firing_cmd.recoil_dy
+
+        # Apply continuous mouse movement (SendInput, non-blocking)
+        if mouse_dx != 0 or mouse_dy != 0:
+            mouse.move_relative(mouse_dx, mouse_dy)
+
+        # 3. Firing execution (synchronized with trigger events)
+        if decision.firing_cmd.trigger_action == "press":
+            mouse.mouse_down("left")
+            self._is_firing = True
+        elif decision.firing_cmd.trigger_action == "release":
+            self._stop_firing()
+        elif decision.firing_cmd.trigger_action == "hold" and not self._is_firing:
+            mouse.mouse_down("left")
+            self._is_firing = True
+
+        # 4. Movement execution
+        if decision.should_reload:
+            self._stop_firing()
+            keyboard.key_press(keybinds["reload"])
+        elif decision.phase in (BotPhase.ENGAGING, BotPhase.RETREATING):
+            self._apply_combat_movement(decision.movement_keys, keybinds)
+        elif decision.phase in (BotPhase.ROAMING, BotPhase.SCANNING):
+            self._stop_firing()
+            self._roam(frame, keybinds)
+
+        # 5. Idle actions
+        if decision.idle_action == "inspect":
+            keyboard.key_press(keybinds["inspect"])
+
+    def _apply_combat_movement(self, move_keys: dict[str, bool], keybinds: dict) -> None:
+        """Apply combat movement keys based on stateful decision output."""
+        for action_name in ("forward", "back", "left", "right", "crouch", "walk"):
+            bind_key = keybinds.get(action_name)
+            if not bind_key:
+                continue
+            should_hold = move_keys.get(action_name, False)
+            is_held = bind_key in self._movement_keys_held
+            if should_hold and not is_held:
+                keyboard.hold_key(bind_key)
+                self._movement_keys_held.add(bind_key)
+            elif not should_hold and is_held:
+                keyboard.release_key(bind_key)
+                self._movement_keys_held.discard(bind_key)
 
     def _execute_action(self, action: Action, frame, enemies: list[Detection]) -> None:
         """Execute a decided action."""
@@ -539,6 +634,7 @@ class Bot:
             mouse.mouse_up("left")
             self._is_firing = False
             self.recoil.reset()
+            self.player_state.reset_spray()
 
     def _handle_combat_movement(self, move: str | None, keybinds: dict) -> None:
         """Apply combat movement (strafing, crouching)."""

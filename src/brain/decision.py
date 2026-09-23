@@ -1,10 +1,16 @@
-"""High-level decision making for the bot."""
+"""High-level decision making with state persistence and contextual awareness."""
+
+from __future__ import annotations
 
 import random
+from typing import TYPE_CHECKING
 
+from src.behavior.personality import PersonalityTraits
 from src.brain.state_machine import BotState
-from src.humanizer.personality import Personality
 from src.vision.detector import Detection
+
+if TYPE_CHECKING:
+    from src.humanizer.personality import Personality
 
 
 class Action:
@@ -19,13 +25,16 @@ class Action:
 
 
 class DecisionMaker:
-    """Makes high-level decisions based on game state and personality."""
+    """Makes coherent high-level decisions based on persistent state and context."""
 
-    def __init__(self, personality: Personality):
+    def __init__(self, personality: Personality | PersonalityTraits):
         self.personality = personality
-        self._last_fire_time = 0.0
         self._spray_count = 0
         self._current_target: Detection | None = None
+        self._target_engaged_time: float = 0.0
+        self._combat_move_direction: str = "none"
+        self._combat_move_ticks: int = 0
+        self._last_fire_mode: str = "tap"
 
     def decide(
         self,
@@ -35,73 +44,106 @@ class DecisionMaker:
         ammo_clip: int,
         time_in_state: float,
     ) -> Action:
-        """Make a decision based on current state.
-
-        Returns an Action to execute.
-        """
+        """Make a decision based on current state with temporal continuity."""
         if state == BotState.DEAD:
+            self._current_target = None
+            self._spray_count = 0
             return self._decide_dead(time_in_state)
         elif state == BotState.FIGHTING:
             return self._decide_fighting(enemies, health, ammo_clip)
         elif state == BotState.SEARCHING:
+            self._current_target = None
             return self._decide_searching(time_in_state)
         elif state == BotState.RETREATING:
             return self._decide_retreating(enemies)
         elif state == BotState.STUCK:
             return self._decide_stuck(time_in_state)
         else:  # ROAMING
+            self._current_target = None
             return self._decide_roaming()
 
     def _decide_dead(self, time_in_state: float) -> Action:
-        """Wait for respawn. In DM, respawn is automatic."""
-        # Occasionally click mouse to respawn faster
+        """Wait for respawn in Deathmatch."""
         if time_in_state > 1.0 and random.random() < 0.1:
             return Action("click")
         return Action("wait")
 
     def _decide_fighting(self, enemies: list[Detection], health: int, ammo_clip: int) -> Action:
-        """Engage enemies in combat."""
+        """Engage enemies with target persistence and continuous firing/movement."""
         if not enemies:
             return Action("search")
 
-        # Need to reload?
         if ammo_clip <= 0:
             self._spray_count = 0
             return Action("reload")
 
-        # Select target (closest to crosshair)
-        target = enemies[0]  # Pre-sorted by targeting system
+        # Target persistence: maintain current target if still present among detections
+        target = None
+        if self._current_target is not None:
+            # Check if previous target still roughly matches any enemy detection
+            tcx, tcy = self._current_target.center
+            for e in enemies:
+                ecx, ecy = e.center
+                if ((ecx - tcx) ** 2 + (ecy - tcy) ** 2) < (150.0**2):
+                    target = e
+                    break
 
-        # Decide fire mode
-        fire_mode = self._choose_fire_mode()
+        if target is None:
+            # Acquire top priority target
+            target = enemies[0]
+            self._current_target = target
+            self._spray_count = 0
 
-        # Combat movement
-        move = None
-        if self.personality.strafe_while_shooting:
-            if random.random() < self.personality.crouch_spray_chance:
-                move = "crouch"
-            else:
-                move = random.choice(["strafe_left", "strafe_right"])
+        # Decide fire mode based on distance and personality discipline
+        fire_mode = self._choose_fire_mode(target)
+
+        # Stateful combat movement with directional commitment
+        move = self._update_combat_movement()
 
         return Action("engage", target=target, fire_mode=fire_mode, combat_move=move)
 
-    def _choose_fire_mode(self) -> str:
-        """Choose between tap, burst, or spray."""
-        if random.random() < self.personality.tap_chance:
+    def _choose_fire_mode(self, target: Detection) -> str:
+        """Choose fire mode contextually based on distance and personality."""
+        p = self.personality
+        est_distance = 1000.0 / max(target.area**0.5, 1.0)
+
+        # Long range: tap fire
+        if est_distance > 18.0:
             self._spray_count = 0
             return "tap"
 
-        burst_lo, burst_hi = self.personality.burst_length
+        # Tapping preference
+        if random.random() < getattr(p, "tap_chance", 0.3):
+            self._spray_count = 0
+            return "tap"
+
+        burst_lo, burst_hi = getattr(p, "burst_length", [3, 7])
         if self._spray_count >= random.randint(burst_lo, burst_hi):
             self._spray_count = 0
-            return "burst_end"  # Stop firing briefly
+            return "burst_end"
 
         self._spray_count += 1
         return "spray"
 
+    def _update_combat_movement(self) -> str | None:
+        """Maintain strafe direction for several ticks instead of jittering."""
+        p = self.personality
+        if not getattr(p, "strafe_while_shooting", True):
+            return None
+
+        self._combat_move_ticks -= 1
+        if self._combat_move_ticks <= 0:
+            # Commit to a new direction for ~10 to 25 ticks (300-800ms at 30Hz)
+            self._combat_move_ticks = random.randint(10, 25)
+            if random.random() < getattr(p, "crouch_spray_chance", 0.4):
+                self._combat_move_direction = "crouch"
+            else:
+                self._combat_move_direction = random.choice(["strafe_left", "strafe_right"])
+
+        return self._combat_move_direction
+
     def _decide_searching(self, time_in_state: float) -> Action:
         """Search for enemies after losing sight."""
-        # Check corners by rotating view
         if time_in_state < 1.0:
             return Action("check_corner", direction="left")
         elif time_in_state < 2.0:
@@ -109,14 +151,13 @@ class DecisionMaker:
         return Action("roam")
 
     def _decide_retreating(self, enemies: list[Detection]) -> Action:
-        """Run away from danger."""
+        """Disengage and flee from threat."""
         if enemies:
-            # Turn away from nearest enemy
             return Action("flee", enemy=enemies[0])
         return Action("roam")
 
     def _decide_stuck(self, time_in_state: float) -> Action:
-        """Recover from being stuck."""
+        """Recover from stuck position."""
         if time_in_state < 1.0:
             return Action("unstick", phase="backup")
         elif time_in_state < 2.0:
@@ -124,16 +165,18 @@ class DecisionMaker:
         return Action("unstick", phase="forward")
 
     def _decide_roaming(self) -> Action:
-        """Normal roaming behavior with idle actions."""
+        """Roaming behavior with occasional idle actions."""
         p = self.personality
-
-        # Random idle behaviors
         roll = random.random()
-        if roll < p.inspect_chance:
+        inspect_chance = getattr(p, "inspect_chance", 0.01)
+        look_around_chance = getattr(p, "look_around_chance", 0.03)
+        random_jump_chance = getattr(p, "random_jump_chance", 0.01)
+
+        if roll < inspect_chance:
             return Action("inspect_weapon")
-        elif roll < p.inspect_chance + p.look_around_chance:
+        elif roll < inspect_chance + look_around_chance:
             return Action("look_around")
-        elif roll < p.inspect_chance + p.look_around_chance + p.random_jump_chance:
+        elif roll < inspect_chance + look_around_chance + random_jump_chance:
             return Action("jump")
 
         return Action("roam")

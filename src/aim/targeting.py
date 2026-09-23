@@ -17,6 +17,9 @@ class TargetingSystem:
         m_yaw: float = 0.022,
         m_pitch: float = 0.022,
         head_aim_chance: float = 0.3,
+        fov_horizontal: float = 90.0,
+        screen_width: int = 3440,
+        screen_height: int = 1440,
     ):
         self.cx = screen_center_x
         self.cy = screen_center_y
@@ -24,6 +27,9 @@ class TargetingSystem:
         self.m_yaw = m_yaw
         self.m_pitch = m_pitch
         self.head_aim_chance = head_aim_chance
+        self.fov_horizontal = fov_horizontal
+        self.screen_width = screen_width
+        self.screen_height = screen_height
 
     def get_aim_delta(self, detection: Detection) -> tuple[int, int, float]:
         """Calculate mouse movement needed to aim at a detection.
@@ -49,9 +55,16 @@ class TargetingSystem:
         # Distance for priority calculation
         screen_dist = distance((self.cx, self.cy), (aim_x, aim_y))
 
-        # Convert to mouse counts
+        # Convert to mouse counts with proper FOV and resolution
         mouse_dx, mouse_dy = screen_delta_to_mouse(
-            dx_pixels, dy_pixels, self.sensitivity, self.m_yaw, self.m_pitch
+            dx_pixels,
+            dy_pixels,
+            self.sensitivity,
+            self.m_yaw,
+            self.m_pitch,
+            screen_width=self.screen_width,
+            screen_height=self.screen_height,
+            fov_horizontal=self.fov_horizontal,
         )
 
         return mouse_dx, mouse_dy, screen_dist

@@ -43,3 +43,8 @@ combat:
   disengage_health: 40
   reload_threshold: 0.4
   switch_target_delay_ms: 200
+
+scanning:
+  frequency: 0.8
+  amplitude: 0.3
+  hesitation_tendency: 0.1
