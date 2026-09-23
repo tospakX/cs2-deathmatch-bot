@@ -1,8 +1,7 @@
-"""Central decision engine coordinating perception, attention, motor planning, and actions.
+"""Central decision engine coordinating perception, attention, and motor planning.
 
-Replaces the old stateless DecisionMaker.  Maintains temporal continuity
-and processes the complete human-like behavioral pipeline:
-  Perception -> Attention -> PlayerState -> DecisionEngine -> Motor/Firing/Movement Plans
+Maintains temporal continuity across the human-like behavioral pipeline:
+  Perception -> Attention -> Authoritative Aim -> PlayerState -> Motor/Firing Plans
 """
 
 from __future__ import annotations
@@ -16,9 +15,10 @@ from src.behavior.adaptation import AdaptationEngine
 from src.behavior.attention import AttentionSystem
 from src.behavior.firing import FiringCommand, FiringController
 from src.behavior.movement import MovementController
-from src.behavior.player_state import AimPhase, BotPhase
+from src.behavior.player_state import AimPhase, AuthoritativeAim, BotPhase
 from src.behavior.reaction import ReactionSystem
 from src.behavior.scanning import ScanningController
+from src.utils.math_helpers import screen_delta_to_mouse
 
 if TYPE_CHECKING:
     from src.behavior.personality import PersonalityTraits
@@ -47,9 +47,22 @@ class DecisionEngine:
         personality: PersonalityTraits,
         screen_center: tuple[int, int],
         weapon: str = "default",
+        sensitivity: float = 1.0,
+        m_yaw: float = 0.022,
+        m_pitch: float = 0.022,
+        fov_h: float = 122.0,
+        screen_width: int = 3440,
+        screen_height: int = 1440,
     ):
         self.personality = personality
         self.cx, self.cy = screen_center
+        self.sensitivity = sensitivity
+        self.m_yaw = m_yaw
+        self.m_pitch = m_pitch
+        self.fov_h = fov_h
+        self.screen_w = screen_width
+        self.screen_h = screen_height
+
         self.attention = AttentionSystem(screen_center, personality)
         self.reaction = ReactionSystem(personality)
         self.firing = FiringController(personality, weapon)
@@ -63,12 +76,7 @@ class DecisionEngine:
         state: PlayerState,
         visible_targets: list[TrackedTarget],
     ) -> DecisionOutput:
-        """Run one tick of the decision pipeline.
-
-        Args:
-            state: Persistent player state.
-            visible_targets: Currently visible tracked targets from perception layer.
-        """
+        """Run one tick of the decision pipeline."""
         now = state.now
         p = self.personality
 
@@ -94,7 +102,7 @@ class DecisionEngine:
         self.attention.update(state, visible_targets)
         target = state.primary_target
 
-        # Detect new target acquisition -> trigger contextual reaction
+        # Detect target acquisition / loss events
         if target is not None and target is not self._prev_primary_target:
             context = "new_target"
             if target is state.previous_target:
@@ -107,6 +115,9 @@ class DecisionEngine:
             self.reaction.initiate_reaction(state, target, context)
             self._prev_primary_target = target
         elif target is None and self._prev_primary_target is not None:
+            # If previous target was shot multiple times and vanished, treat as potential kill
+            if self._prev_primary_target.shots_at >= 3:
+                self.adaptation.on_engagement_won(state)
             self._prev_primary_target = None
             if state.aim_phase != AimPhase.IDLE:
                 state.aim_phase = AimPhase.IDLE
@@ -114,66 +125,129 @@ class DecisionEngine:
         # ── 3. Reaction update ───────────────────────────────────────────────
         self.reaction.update(state)
 
-        # ── 4. Adaptation update ─────────────────────────────────────────────
+        # ── 4. Authoritative Aim State (Calculated ONCE per tick) ────────────
+        if target is not None:
+            # Select aim preference once upon acquisition (never reroll per frame!)
+            if not target.aim_preference:
+                head_choice = random.random() < p.head_aim_preference
+                target.aim_preference = "head" if head_choice else "chest"
+                target.aim_offset_ratio = (0.5, 0.18) if head_choice else (0.5, 0.45)
+
+            # Compute screen coordinates of the persistent aim point
+            d = target.detection
+            w = max(1.0, d.x2 - d.x1)
+            h = max(1.0, d.y2 - d.y1)
+            rx, ry = target.aim_offset_ratio
+            aim_x = d.x1 + w * rx
+            aim_y = d.y1 + h * ry
+
+            err_x = aim_x - self.cx
+            err_y = aim_y - self.cy
+            err_dist = math.sqrt(err_x * err_x + err_y * err_y)
+
+            mouse_dx, mouse_dy = screen_delta_to_mouse(
+                err_x,
+                err_y,
+                self.sensitivity,
+                self.m_yaw,
+                self.m_pitch,
+                self.screen_w,
+                self.screen_h,
+                self.fov_h,
+            )
+
+            state.authoritative_aim = AuthoritativeAim(
+                target_id=target.target_id,
+                aim_point_screen=(aim_x, aim_y),
+                screen_error=(err_x, err_y),
+                screen_error_dist=err_dist,
+                motor_error=(float(mouse_dx), float(mouse_dy)),
+                aim_preference=target.aim_preference,
+                is_valid=True,
+            )
+            state.current_aim_error = (err_x, err_y)
+        else:
+            state.authoritative_aim = AuthoritativeAim()
+            state.current_aim_error = (0.0, 0.0)
+
+        # ── 5. Adaptation update ─────────────────────────────────────────────
         self.adaptation.update(state)
 
-        # ── 5. High-level Phase determination ────────────────────────────────
+        # ── 6. Persistent Reload Machine ─────────────────────────────────────
+        should_press_reload_key = False
         action_type = "roam"
-        should_reload = False
+        reload_ep = state.reload_episode
 
-        # Need reload check: ammo depleted or safe reload when low and out of combat
-        if state.ammo_clip <= 0:
-            should_reload = True
-            action_type = "reload"
-        elif (
-            target is None
-            and state.ammo_clip < 15
-            and random.random() < (1.0 - p.firing_discipline) * 0.02
-        ):
-            should_reload = True
-            action_type = "reload"
-
-        if target is not None:
-            if state.health <= p.disengage_health:
-                state.transition_phase(BotPhase.RETREATING)
-                action_type = "retreat"
+        if reload_ep.is_reloading:
+            # Check if reload finished (expected duration elapsed or HUD confirmed ammo restored)
+            if (now - reload_ep.start_time >= reload_ep.expected_duration) or (
+                state.ammo_clip > 15
+            ):
+                reload_ep.is_reloading = False
+                reload_ep.key_pressed = False
+                state.transition_phase(BotPhase.ROAMING)
             else:
-                state.transition_phase(BotPhase.ENGAGING)
-                action_type = "engage"
-        elif state.last_enemy_positions and (now - state.last_enemy_positions[-1][2] < 3.0):
-            state.transition_phase(BotPhase.SCANNING)
-            action_type = "search"
+                state.transition_phase(BotPhase.RELOADING)
+                action_type = "reload"
         else:
-            state.transition_phase(BotPhase.ROAMING)
-            action_type = "roam"
+            # Check if reload should be initiated
+            need_reload = state.ammo_clip <= 0
+            tactical_reload = (
+                target is None
+                and state.ammo_clip < 15
+                and random.random() < ((1.0 - p.firing_discipline) * 0.02)
+            )
+            if need_reload or tactical_reload:
+                reload_ep.is_reloading = True
+                reload_ep.start_time = now
+                reload_ep.expected_duration = 2.7
+                reload_ep.key_pressed = True
+                should_press_reload_key = True
+                state.transition_phase(BotPhase.RELOADING)
+                action_type = "reload"
 
-        # ── 6. Aim error calculation ─────────────────────────────────────────
-        err_dist = 999.0
-        if target is not None:
-            tcx, tcy = target.detection.center
-            err_dist = math.sqrt((tcx - self.cx) ** 2 + (tcy - self.cy) ** 2)
+        # ── 7. High-level Phase determination ────────────────────────────────
+        if not reload_ep.is_reloading:
+            if target is not None:
+                if state.health <= p.disengage_health:
+                    state.transition_phase(BotPhase.RETREATING)
+                    action_type = "retreat"
+                else:
+                    state.transition_phase(BotPhase.ENGAGING)
+                    action_type = "engage"
+            elif state.last_enemy_positions and (now - state.last_enemy_positions[-1][2] < 3.0):
+                state.transition_phase(BotPhase.SCANNING)
+                action_type = "search"
+            else:
+                state.transition_phase(BotPhase.ROAMING)
+                action_type = "roam"
 
-        # ── 7. Firing plan ───────────────────────────────────────────────────
-        firing_cmd = self.firing.update(state, target, err_dist)
+        # ── 8. Firing plan (Consumes Authoritative Aim State) ─────────────────
+        firing_cmd = FiringCommand()
+        if not reload_ep.is_reloading:
+            err_dist = state.authoritative_aim.screen_error_dist
+            firing_cmd = self.firing.update(state, target, err_dist)
 
-        # ── 8. Movement plan ─────────────────────────────────────────────────
+        # ── 9. Movement plan ─────────────────────────────────────────────────
         move_keys = self.movement.update(state, target, firing_cmd.is_firing)
         if firing_cmd.should_crouch:
             move_keys["crouch"] = True
 
-        # ── 9. Scanning / looking plan ───────────────────────────────────────
+        # ── 10. Scanning / looking plan ──────────────────────────────────────
         scan_delta = (0.0, 0.0)
-        if target is None:
+        if target is None and not reload_ep.is_reloading:
             scan_delta = self.scanning.update(state)
 
-        # ── 10. Idle quirks (inspect weapon / random fidget) ──────────────────
+        # ── 11. Idle quirks ──────────────────────────────────────────────────
         idle_action = None
-        if state.phase == BotPhase.ROAMING and not firing_cmd.is_firing:
+        if (
+            state.phase == BotPhase.ROAMING
+            and not firing_cmd.is_firing
+            and not reload_ep.is_reloading
+        ):
             roll = random.random()
-            if roll < p.inspect_tendency * 0.05:
+            if roll < p.inspect_tendency * 0.03:
                 idle_action = "inspect"
-            elif roll < (p.inspect_tendency + p.fidget_tendency) * 0.05:
-                idle_action = "fidget"
 
         return DecisionOutput(
             phase=state.phase,
@@ -182,6 +256,6 @@ class DecisionEngine:
             firing_cmd=firing_cmd,
             movement_keys=move_keys,
             scan_delta=scan_delta,
-            should_reload=should_reload,
+            should_reload=should_press_reload_key,
             idle_action=idle_action,
         )

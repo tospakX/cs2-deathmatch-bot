@@ -1,12 +1,11 @@
-"""Contextual firing behavior and shot-based recoil synchronization.
+"""Contextual firing behavior, firing episodes, and shot-synchronized recoil.
 
 Firing decisions arise from:
 - Target distance (pixel distance & estimated range from bounding box area)
-- Target size and movement velocity
-- Current aim error (gating: do not spray if crosshair is far off target)
+- Authoritative aim error
 - Weapon characteristics (cycle time, recoil curve, reset time)
-- Confidence and personality firing discipline
-- Engagement phase and burst state
+- Confidence, panic, and personality firing discipline
+- Committed FiringEpisodes (tap, burst, spray) rather than per-tick mode flapping
 
 Recoil is strictly SHOT-BASED:
 - Advances only when an actual shot is fired based on weapon fire-rate / cycle time
@@ -146,16 +145,13 @@ class FiringCommand:
 
 
 class FiringController:
-    """Manages contextual firing decisions and shot-synchronized recoil."""
+    """Manages contextual firing episodes and shot-synchronized recoil."""
 
     def __init__(self, personality: PersonalityTraits, weapon: str = "default"):
         self.personality = personality
         self.weapon = weapon
         self._last_shot_time: float = 0.0
-        self._trigger_pressed_time: float = 0.0
-        self._target_shots_in_burst: int = 0
-        self._burst_pause_until: float = 0.0
-        self._cooldown_until: float = 0.0
+        self._recoil_bias_x: float = random.gauss(0, 0.2)
 
     @property
     def cycle_time(self) -> float:
@@ -166,178 +162,205 @@ class FiringController:
         self.weapon = weapon
         state.weapon = weapon
         state.reset_spray()
-        self._target_shots_in_burst = 0
+        state.firing_episode.active = False
 
     def update(
         self,
         state: PlayerState,
         target: TrackedTarget | None,
-        err_dist: float,
+        err_dist: float = 0.0,
     ) -> FiringCommand:
-        """Update firing state and produce firing/recoil commands for this tick.
-
-        Args:
-            state: Central player state.
-            target: Currently engaged target (if any).
-            err_dist: Pixel distance from crosshair to aim point.
-        """
+        """Update firing state and produce firing/recoil commands for this tick."""
         now = state.now
         cmd = FiringCommand()
         p = self.personality
+        episode = state.firing_episode
+        err_dist_px = err_dist
 
-        # Check if recoil has reset during trigger release
+        # Check recoil reset after trigger release
         if not state.is_trigger_held:
             if state.recoil_shot_index > 0 and (now - self._last_shot_time) > RECOIL_RESET_TIME:
                 state.reset_spray()
 
-        # Cannot fire if dead or no ammo or waiting for burst pause / cooldown
+        # Cannot fire if dead or out of ammo
         if not state.is_alive or state.ammo_clip <= 0:
             if state.is_trigger_held:
                 cmd.trigger_action = "release"
                 state.is_trigger_held = False
                 state.firing_phase = FiringPhase.NOT_FIRING
+            episode.active = False
             return cmd
 
-        if now < self._burst_pause_until:
+        # Waiting out burst pause or episode cooldown
+        if now < episode.pause_until or now < episode.cooldown_until:
             if state.is_trigger_held:
                 cmd.trigger_action = "release"
                 state.is_trigger_held = False
                 state.firing_phase = FiringPhase.BURST_PAUSE
             return cmd
 
-        # If no target or still reacting to target, release trigger
-        if (
-            target is None
-            or state.aim_phase == AimPhase.REACTING
-            or state.aim_phase == AimPhase.IDLE
-        ):
+        # If no target or still reacting, release trigger
+        if target is None or state.aim_phase in (AimPhase.REACTING, AimPhase.IDLE):
+            if state.is_trigger_held:
+                cmd.trigger_action = "release"
+                state.is_trigger_held = False
+                state.firing_phase = FiringPhase.NOT_FIRING
+            episode.active = False
+            return cmd
+
+        # ── 1. Graded Aim Error Firing Gate (not binary) ─────────────────────
+        # Real players shoot with graded readiness based on aim error, panic, and distance
+        tight_threshold = 28.0 + (1.0 - p.firing_discipline) * 35.0
+        if target.detection.area > 12000:
+            tight_threshold *= 1.4
+
+        # Graded probability: if aim is within tight threshold, fire.
+        # If slightly outside, probability decays smoothly rather than abrupt cliff.
+        can_fire = False
+        if err_dist_px <= tight_threshold:
+            can_fire = True
+        elif episode.active and episode.mode == "spray" and state.is_trigger_held:
+            # Committed sprayers tolerate brief tracking overshoot
+            can_fire = err_dist_px <= (tight_threshold * 1.6)
+        else:
+            # Graded chance of premature / hurried shot
+            over_err = err_dist_px - tight_threshold
+            panic_bonus = (1.0 - state.confidence) * 0.2 if state.health < 40 else 0.0
+            premature_prob = max(0.0, 0.25 + panic_bonus - (over_err / 60.0))
+            can_fire = random.random() < premature_prob
+
+        if not can_fire:
             if state.is_trigger_held:
                 cmd.trigger_action = "release"
                 state.is_trigger_held = False
                 state.firing_phase = FiringPhase.NOT_FIRING
             return cmd
 
-        # ── Aim error gating ─────────────────────────────────────────────────
-        # Human players do not hold trigger when aim is way off target (> 50-70px).
-        # Precision players have tighter gating.
-        max_firing_err = 35.0 + (1.0 - p.firing_discipline) * 45.0
-        # If target is very close (large bbox area), we can tolerate wider aim error.
-        if target.detection.area > 15000:
-            max_firing_err *= 1.4
-
-        if err_dist > max_firing_err:
-            # Crosshair not on target yet
-            if state.is_trigger_held:
-                cmd.trigger_action = "release"
-                state.is_trigger_held = False
-                state.firing_phase = FiringPhase.NOT_FIRING
-            return cmd
-
-        # ── Choose / evaluate firing mode ────────────────────────────────────
-        # Contextual decision:
-        # Long distance (small bbox, large screen dist) -> Tap
-        # Medium distance -> Burst (2-5 shots)
-        # Close distance -> Spray (controlled pull-down)
+        # ── 2. Firing Episode Commitment ─────────────────────────────────────
         est_distance = 1000.0 / max(math.sqrt(target.detection.area), 1.0)
-        mode = self._select_fire_mode(state, target, err_dist, est_distance)
-        cmd.mode = mode
 
-        # ── Execute mode state machine ───────────────────────────────────────
-        if mode == "tap":
-            return self._handle_tap(state, now, cmd)
-        elif mode == "burst":
-            return self._handle_burst(state, now, cmd)
-        else:  # "spray"
-            return self._handle_spray(state, now, cmd)
+        if not episode.active:
+            # Start new firing episode based on context
+            episode.active = True
+            episode.start_time = now
+            episode.shots_fired = 0
+            if state.firing_phase == FiringPhase.BURSTING:
+                mode = "burst"
+            elif state.firing_phase == FiringPhase.TAPPING:
+                mode = "tap"
+            elif state.firing_phase == FiringPhase.SPRAYING:
+                mode = "spray"
+            else:
+                mode = self._choose_episode_mode(p, est_distance, err_dist_px)
+            episode.mode = mode
 
-    def _select_fire_mode(
+            if mode == "tap":
+                episode.shots_planned = 1
+            elif mode == "burst":
+                if getattr(self, "_target_shots_in_burst", 0) > 0:
+                    episode.shots_planned = self._target_shots_in_burst
+                else:
+                    lo = max(2, int(3 - p.firing_discipline * 2))
+                    hi = max(lo + 1, int(5 - p.firing_discipline * 2))
+                    episode.shots_planned = random.randint(lo, hi)
+            else:  # spray
+                episode.shots_planned = int(8 + (1.0 - p.firing_discipline) * 10)
+
+        cmd.mode = episode.mode
+
+        # ── 3. Crouch Episode Management ─────────────────────────────────────
+        # Update crouch statefully without 30Hz flutter
+        crouch = state.crouch_episode
+        if not crouch.is_crouching:
+            # Can we initiate a crouch during sustained spray?
+            if (
+                episode.mode == "spray"
+                and episode.shots_fired >= 3
+                and now >= crouch.cooldown_until
+                and random.random() < p.crouch_tendency * 0.3
+            ):
+                crouch.is_crouching = True
+                crouch.start_time = now
+                crouch.duration = random.uniform(0.7, 1.4)
+                state.is_crouching = True
+        else:
+            if (now - crouch.start_time) >= crouch.duration or not episode.active:
+                crouch.is_crouching = False
+                crouch.cooldown_until = now + random.uniform(1.2, 2.5)
+                state.is_crouching = False
+
+        cmd.should_crouch = state.is_crouching
+
+        # ── 4. Execute Mode on Actual Weapon Cycle Rate ──────────────────────
+        if episode.mode == "tap":
+            return self._execute_tap(state, now, cmd)
+        elif episode.mode == "burst":
+            return self._execute_burst(state, now, cmd)
+        else:
+            return self._execute_spray(state, now, cmd)
+
+    def _choose_episode_mode(
         self,
-        state: PlayerState,
-        target: TrackedTarget,
-        err_dist: float,
+        p: PersonalityTraits,
         est_distance: float,
+        err_dist_px: float,
     ) -> str:
-        """Select appropriate fire mode based on combat context."""
+        """Choose firing mode when initiating a new episode."""
+        if est_distance > 16.0 or err_dist_px > 30.0:
+            return "tap" if random.random() < (0.35 + p.firing_discipline * 0.45) else "burst"
+        elif est_distance > 8.0:
+            return "burst" if random.random() < (0.4 + p.firing_discipline * 0.4) else "spray"
+        else:
+            return (
+                "spray" if random.random() < (0.65 + (1.0 - p.firing_discipline) * 0.3) else "burst"
+            )
+
+    def _execute_tap(self, state: PlayerState, now: float, cmd: FiringCommand) -> FiringCommand:
+        """Single tap with recovery delay."""
         p = self.personality
-
-        # If already committed to a burst, stay in burst until target shots reached
-        if state.firing_phase == FiringPhase.BURSTING:
-            return "burst"
-
-        # If already spraying and target remains in range, stay spraying
-        if state.firing_phase == FiringPhase.SPRAYING and state.is_trigger_held:
-            max_spray = int(8 + (1.0 - p.firing_discipline) * 12)
-            if state.shot_count < max_spray:
-                return "spray"
-            # Spray limit reached -> force burst pause
-            return "tap"
-
-        # Far distance -> tap
-        if est_distance > 15.0 or err_dist > 25.0:
-            if random.random() < (0.3 + p.firing_discipline * 0.5):
-                return "tap"
-            return "burst"
-
-        # Medium distance -> burst
-        if est_distance > 8.0:
-            if random.random() < p.firing_discipline * 0.7:
-                return "burst"
-            return "spray"
-
-        # Close quarters -> spray
-        if random.random() < (0.7 + (1.0 - p.firing_discipline) * 0.3):
-            return "spray"
-        return "burst"
-
-    def _handle_tap(self, state: PlayerState, now: float, cmd: FiringCommand) -> FiringCommand:
-        """Single tap fire with spread recovery delay."""
-        p = self.personality
-        tap_interval = self.cycle_time + (0.100 + (1.0 - p.firing_discipline) * 0.150)
+        episode = state.firing_episode
+        tap_interval = self.cycle_time + (0.080 + (1.0 - p.firing_discipline) * 0.120)
 
         if now - self._last_shot_time >= tap_interval:
-            # Fire single shot
             cmd.trigger_action = "press"
             state.is_trigger_held = True
             state.firing_phase = FiringPhase.TAPPING
-            self._record_shot_fired(state, now)
+            self._record_shot(state, now)
             cmd.is_firing = True
-            self._apply_shot_recoil(state, cmd)
-            # Schedule release on next tick
+            self._apply_recoil(state, cmd)
+
+            episode.shots_fired += 1
+            episode.active = False
+            episode.pause_until = now + tap_interval
         elif state.is_trigger_held:
             cmd.trigger_action = "release"
             state.is_trigger_held = False
 
         return cmd
 
-    def _handle_burst(self, state: PlayerState, now: float, cmd: FiringCommand) -> FiringCommand:
-        """Burst fire of N actual shots followed by recovery pause."""
+    def _execute_burst(self, state: PlayerState, now: float, cmd: FiringCommand) -> FiringCommand:
+        """Multi-shot burst advancing strictly on cycle time."""
         p = self.personality
+        episode = state.firing_episode
+        state.firing_phase = FiringPhase.BURSTING
 
-        if state.firing_phase != FiringPhase.BURSTING:
-            # Initialize new burst
-            state.firing_phase = FiringPhase.BURSTING
-            # Burst length in actual bullets: 2 to 5 based on discipline
-            lo = max(2, int(3 - p.firing_discipline * 2))
-            hi = max(lo + 1, int(5 - p.firing_discipline * 2))
-            self._target_shots_in_burst = random.randint(lo, hi)
-
-        # Check if enough time has elapsed to advance a shot
         if now - self._last_shot_time >= self.cycle_time:
             if not state.is_trigger_held:
                 cmd.trigger_action = "hold"
                 state.is_trigger_held = True
 
-            self._record_shot_fired(state, now)
+            self._record_shot(state, now)
             cmd.is_firing = True
-            self._apply_shot_recoil(state, cmd)
+            self._apply_recoil(state, cmd)
+            episode.shots_fired += 1
 
-            # Check if burst target reached
-            if state.shot_count >= self._target_shots_in_burst:
+            if episode.shots_fired >= episode.shots_planned:
                 cmd.trigger_action = "release"
                 state.is_trigger_held = False
                 state.firing_phase = FiringPhase.BURST_PAUSE
-                pause_time = 0.200 + p.firing_discipline * 0.250
-                self._burst_pause_until = now + pause_time
+                pause_time = 0.180 + p.firing_discipline * 0.220
+                episode.pause_until = now + pause_time
+                episode.active = False
                 state.reset_spray()
         else:
             if state.is_trigger_held:
@@ -346,23 +369,28 @@ class FiringController:
 
         return cmd
 
-    def _handle_spray(self, state: PlayerState, now: float, cmd: FiringCommand) -> FiringCommand:
-        """Full spray with recoil compensation and crouch evaluation."""
-        p = self.personality
+    def _execute_spray(self, state: PlayerState, now: float, cmd: FiringCommand) -> FiringCommand:
+        """Sustained spray with recoil compensation."""
+        episode = state.firing_episode
         state.firing_phase = FiringPhase.SPRAYING
-
-        # Contextual crouch: crouch during sustained spray (shot 3+)
-        if state.shot_count >= 3 and random.random() < p.crouch_tendency:
-            cmd.should_crouch = True
 
         if now - self._last_shot_time >= self.cycle_time:
             if not state.is_trigger_held:
                 cmd.trigger_action = "hold"
                 state.is_trigger_held = True
 
-            self._record_shot_fired(state, now)
+            self._record_shot(state, now)
             cmd.is_firing = True
-            self._apply_shot_recoil(state, cmd)
+            self._apply_recoil(state, cmd)
+            episode.shots_fired += 1
+
+            if episode.shots_fired >= episode.shots_planned:
+                cmd.trigger_action = "release"
+                state.is_trigger_held = False
+                state.firing_phase = FiringPhase.COOLDOWN
+                episode.cooldown_until = now + 0.350
+                episode.active = False
+                state.reset_spray()
         else:
             if state.is_trigger_held:
                 cmd.trigger_action = "hold"
@@ -370,17 +398,14 @@ class FiringController:
 
         return cmd
 
-    def _record_shot_fired(self, state: PlayerState, now: float) -> None:
-        """Record shot occurrence in state and timers."""
+    def _record_shot(self, state: PlayerState, now: float) -> None:
         self._last_shot_time = now
         state.record_shot()
 
-    def _apply_shot_recoil(self, state: PlayerState, cmd: FiringCommand) -> None:
-        """Compute recoil compensation for the shot just fired."""
+    def _apply_recoil(self, state: PlayerState, cmd: FiringCommand) -> None:
         p = self.personality
         pattern = WEAPON_RECOIL_PATTERNS.get(self.weapon, WEAPON_RECOIL_PATTERNS["default"])
         shot_idx = state.recoil_shot_index - 1
-
         if shot_idx < 0:
             return
 
@@ -389,13 +414,13 @@ class FiringController:
         else:
             base_dx, base_dy = pattern[-1]
 
-        # Recoil skill scales compensation accuracy (0.4 to 0.95 for human players)
         skill = max(0.2, min(1.0, p.recoil_skill))
-        # Imperfect compensation with natural jitter
-        jitter = random.uniform(0.85, 1.15)
-        # Note: CS2 recoil moves crosshair up (-dy in pattern), so compensation must pull DOWN (+dy)
-        comp_dx = int(-base_dx * skill * jitter)
-        comp_dy = int(-base_dy * skill * jitter)
+        # Recoil drift / bias
+        self._recoil_bias_x += random.gauss(0, 0.05)
+        self._recoil_bias_x *= 0.90
+
+        comp_dx = int(-base_dx * skill + self._recoil_bias_x)
+        comp_dy = int(-base_dy * skill)
 
         cmd.recoil_dx = comp_dx
         cmd.recoil_dy = comp_dy

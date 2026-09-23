@@ -8,14 +8,16 @@ This is *what is visible*, not *what the player is focusing on*
 
 from __future__ import annotations
 
-from src.behavior.player_state import PlayerState, TrackedTarget
+import math
+
+from src.behavior.player_state import PlayerState, SpatialMemory, TrackedTarget
 from src.utils.math_helpers import distance
 from src.vision.detector import Detection
 
 # Maximum pixel distance to consider a detection as the same target.
-_MATCH_DISTANCE = 180.0
+_MATCH_DISTANCE = 220.0
 # Maximum bbox size ratio change to match.
-_MATCH_SIZE_RATIO = 0.45
+_MATCH_SIZE_RATIO = 0.35
 # Frames before a missing target is forgotten.
 _FORGET_FRAMES = 15
 
@@ -24,71 +26,116 @@ class PerceptionSystem:
     """Tracks detected enemies across frames, maintaining identity and history.
 
     Each detected enemy is assigned a track_id that persists as long as
-    the enemy keeps appearing in a consistent position.  The system
+    the enemy keeps appearing in a consistent position. The system
     estimates velocity from position changes and maintains visibility
     history.
     """
 
-    def __init__(self, screen_center: tuple[int, int]):
+    def __init__(
+        self,
+        screen_center: tuple[int, int],
+        screen_size: tuple[int, int] = (3440, 1440),
+        fov_h: float = 122.0,
+    ):
         self.cx, self.cy = screen_center
+        self.screen_w, self.screen_h = screen_size
+        self.fov_h = fov_h
+        aspect = self.screen_w / max(1.0, float(self.screen_h))
+        self.fov_v = 2.0 * math.degrees(math.atan(math.tan(math.radians(fov_h / 2.0)) / aspect))
 
     def update(self, state: PlayerState, detections: list[Detection]) -> None:
         """Process new detections and update tracked targets in player state.
 
-        1. Match new detections to existing tracked targets.
-        2. Update matched targets with new positions.
-        3. Create new tracked targets for unmatched detections.
-        4. Mark and prune targets that have been missing too long.
+        Uses globally consistent bipartite matching rather than naive greedy assignment
+        to prevent target identity flapping when enemies cross paths.
         """
         now = state.now
-        matched_tracks: set[int] = set()
-        matched_dets: set[int] = set()
 
         # Filter to body detections only (skip head-only boxes).
         body_dets = [d for d in detections if not d.is_head]
+        tracks = list(state.known_targets.items())
 
-        # Match existing targets to new detections.
-        for track_id, target in list(state.known_targets.items()):
-            best_det_idx = -1
-            best_dist = _MATCH_DISTANCE
+        # ── 1. Global Cost Matrix Computation ──────────────────────────────
+        # Match cost combines:
+        # - Predicted position difference (using smoothed target velocity)
+        # - Bounding box area ratio
+        # - Aspect ratio consistency
+        matches: list[tuple[float, int, int]] = []  # (cost, track_id, det_idx)
 
+        for track_id, target in tracks:
             old_cx, old_cy = target.detection.center
             old_area = target.detection.area
+            old_w = target.detection.width
+            old_h = max(1.0, target.detection.height)
+            old_aspect = old_w / old_h
 
-            for i, det in enumerate(body_dets):
-                if i in matched_dets:
+            # Position prediction using target velocity
+            vx, vy = target.velocity_estimate
+            dt = max(0.001, min(0.3, now - target.last_seen))
+            pred_cx = old_cx + vx * dt
+            pred_cy = old_cy + vy * dt
+
+            for det_idx, det in enumerate(body_dets):
+                det_cx, det_cy = det.center
+                det_w = det.width
+                det_h = max(1.0, det.height)
+                det_aspect = det_w / det_h
+
+                dist = distance((pred_cx, pred_cy), (det_cx, det_cy))
+                if dist > _MATCH_DISTANCE:
                     continue
-                new_cx, new_cy = det.center
-                d = distance((old_cx, old_cy), (new_cx, new_cy))
-                # Also check size similarity.
-                if old_area > 0:
+
+                # Size similarity
+                if old_area > 0 and det.area > 0:
                     size_ratio = min(det.area, old_area) / max(det.area, old_area)
                     if size_ratio < _MATCH_SIZE_RATIO:
                         continue
-                if d < best_dist:
-                    best_dist = d
-                    best_det_idx = i
+                    size_cost = (1.0 - size_ratio) * 100.0
+                else:
+                    size_cost = 50.0
 
-            if best_det_idx >= 0:
-                det = body_dets[best_det_idx]
-                target.detection = det
-                cx, cy = det.center
-                target.update_position(cx, cy, now)
-                target.threat_level = self._compute_threat(det)
-                matched_tracks.add(track_id)
-                matched_dets.add(best_det_idx)
-            else:
+                # Aspect ratio similarity
+                aspect_diff = abs(det_aspect - old_aspect) / max(det_aspect, old_aspect)
+                aspect_cost = aspect_diff * 50.0
+
+                # Combined match cost (lower is better)
+                cost = dist + size_cost + aspect_cost
+                matches.append((cost, track_id, det_idx))
+
+        # Sort candidate matches by lowest cost globally
+        matches.sort(key=lambda m: m[0])
+
+        matched_tracks: set[int] = set()
+        matched_dets: set[int] = set()
+
+        for cost, track_id, det_idx in matches:
+            if track_id in matched_tracks or det_idx in matched_dets:
+                continue
+            matched_tracks.add(track_id)
+            matched_dets.add(det_idx)
+
+            target = state.known_targets[track_id]
+            det = body_dets[det_idx]
+            target.detection = det
+            cx, cy = det.center
+            target.update_position(cx, cy, now)
+            target.threat_level = self._compute_threat(det)
+
+        # Mark unmatched targets as missing
+        for track_id, target in tracks:
+            if track_id not in matched_tracks:
                 target.mark_missing()
 
-        # Create new tracked targets for unmatched detections.
-        for i, det in enumerate(body_dets):
-            if i in matched_dets:
+        # ── 2. Create new tracked targets for unmatched detections ──────────
+        for det_idx, det in enumerate(body_dets):
+            if det_idx in matched_dets:
                 continue
 
             track_id = state.assign_track_id()
             cx, cy = det.center
             target = TrackedTarget(
                 detection=det,
+                target_id=track_id,
                 first_seen=now,
                 last_seen=now,
                 frames_visible=1,
@@ -97,19 +144,35 @@ class PerceptionSystem:
             target.update_position(cx, cy, now)
             state.known_targets[track_id] = target
 
-        # Prune targets that have been missing too long.
+        # ── 3. Prune targets missing too long & record true historical memory ──
         to_remove = []
         for track_id, target in state.known_targets.items():
             if target.frames_missing > _FORGET_FRAMES:
-                # Record last known position for scanning.
                 if len(target.position_history) > 0:
                     last_pos = target.position_history[-1]
-                    state.last_enemy_positions.append((last_pos[0], last_pos[1], now))
+                    px, py, true_timestamp = last_pos
+
+                    # Directional representation relative to camera view
+                    yaw_deg = ((px - self.cx) / max(1.0, float(self.screen_w))) * self.fov_h
+                    pitch_deg = ((py - self.cy) / max(1.0, float(self.screen_h))) * self.fov_v
+
+                    # Store in spatial memory with true observation timestamp
+                    spatial = SpatialMemory(
+                        screen_x=px,
+                        screen_y=py,
+                        yaw_offset_deg=yaw_deg,
+                        pitch_offset_deg=pitch_deg,
+                        last_seen_time=true_timestamp,
+                        confidence=target.detection.confidence,
+                        velocity=target.velocity_estimate,
+                    )
+                    state.spatial_memories.append(spatial)
+                    state.last_enemy_positions.append((px, py, true_timestamp))
+
                 to_remove.append(track_id)
 
         for track_id in to_remove:
             removed = state.known_targets.pop(track_id, None)
-            # If we lost our primary target, clear it.
             if removed is not None and removed is state.primary_target:
                 state.primary_target = None
 

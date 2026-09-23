@@ -4,9 +4,10 @@ Models the full human reaction chain:
   notice → visual confirmation → decision → motor initiation
 
 Reaction time depends on context (surprise, visibility, attention state,
-current engagement, target position) and has temporal correlation — a
-player maintains a reasonably consistent short-term reaction tendency
-rather than independently sampling fresh values for every event.
+current engagement, target position) and has temporal correlation —
+a player maintains a consistent short-term reaction tendency stored in
+PlayerState that drifts slowly rather than independently sampling fresh
+values for every event.
 """
 
 from __future__ import annotations
@@ -26,8 +27,6 @@ class ReactionSystem:
 
     def __init__(self, personality: PersonalityTraits):
         self.personality = personality
-        # Short-term reaction tendency: drifts slowly, not reset per event.
-        self._tendency: float = 1.0
         self._tendency_drift_rate: float = 0.02
 
     def initiate_reaction(
@@ -44,13 +43,13 @@ class ReactionSystem:
         p = self.personality
         modifier = self._compute_context_modifier(state, target, context)
 
-        # Apply short-term tendency (temporal correlation).
-        modifier *= self._tendency
+        # Apply short-term tendency directly from state
+        modifier *= state.reaction_tendency
 
-        # Sample reaction time.
+        # Sample reaction time using personality distribution
         duration = p.sample_reaction_time(modifier)
 
-        # Record.
+        # Record in state
         state.reaction_pending = True
         state.reaction_start = state.now
         state.reaction_duration = duration
@@ -64,12 +63,12 @@ class ReactionSystem:
 
         elapsed = state.now - state.reaction_start
         if elapsed >= state.reaction_duration:
-            # Reaction complete — transition to acquiring.
+            # Reaction complete — transition to acquiring
             state.reaction_pending = False
             state.aim_phase = AimPhase.ACQUIRING
             state.recent_reaction_times.append(state.reaction_duration)
-            # Slowly drift tendency.
-            self._drift_tendency()
+            # Drift tendency in state
+            self._drift_tendency(state)
 
     def _compute_context_modifier(
         self,
@@ -86,55 +85,40 @@ class ReactionSystem:
 
         # ── Surprise vs expectation ──────────────────────────────────────
         if context == "surprise":
-            # Target appeared unexpectedly.
-            modifier *= 1.3
+            modifier *= 1.25
         elif context == "reacquire":
-            # Target was recently tracked — faster to react.
-            modifier *= 0.7
+            modifier *= 0.72
         elif context == "switch":
-            # Switching to already-visible target.
             modifier *= 0.85
 
         # ── Target visibility ────────────────────────────────────────────
-        if target.frames_visible > 10:
-            # Target has been visible for a while — faster.
-            modifier *= 0.8
+        if target.frames_visible > 8:
+            modifier *= 0.82
         elif target.frames_visible <= 2:
-            # Just appeared — slower.
-            modifier *= 1.15
+            modifier *= 1.18
 
         # ── Attention state ──────────────────────────────────────────────
         if state.attention_confidence > 0.7:
-            # Already focused — faster.
             modifier *= 0.85
         elif state.attention_confidence < 0.3:
-            # Unfocused — slower.
-            modifier *= 1.2
+            modifier *= 1.15
 
         # ── Current engagement ───────────────────────────────────────────
         if state.phase == BotPhase.ENGAGING:
-            # Already in combat — faster reactions to new threats.
-            modifier *= 0.9
+            modifier *= 0.90
 
         # ── Awareness level ──────────────────────────────────────────────
-        # High awareness (just lost a target, heard something) = faster.
-        modifier *= 1.3 - state.awareness_level * 0.5
+        modifier *= 1.25 - state.awareness_level * 0.45
 
         # ── Confidence ───────────────────────────────────────────────────
-        # High confidence = slightly faster reactions.
-        modifier *= 1.1 - state.confidence * 0.2
+        modifier *= 1.10 - state.confidence * 0.20
 
-        return max(0.5, min(2.0, modifier))
+        return max(0.55, min(1.85, modifier))
 
-    def _drift_tendency(self) -> None:
-        """Slowly drift the short-term reaction tendency.
-
-        This creates temporal correlation: a player who was reacting
-        fast will tend to keep reacting fast, and vice versa.
-        """
-        # Small random walk.
+    def _drift_tendency(self, state: PlayerState) -> None:
+        """Slowly drift the unified reaction tendency in PlayerState."""
         drift = random.gauss(0, self._tendency_drift_rate)
-        self._tendency += drift
-        # Mean-revert toward 1.0.
-        self._tendency += (1.0 - self._tendency) * 0.1
-        self._tendency = max(0.7, min(1.3, self._tendency))
+        state.reaction_tendency += drift
+        # Mean-revert toward 1.0
+        state.reaction_tendency += (1.0 - state.reaction_tendency) * 0.08
+        state.reaction_tendency = max(0.75, min(1.30, state.reaction_tendency))

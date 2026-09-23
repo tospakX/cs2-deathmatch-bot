@@ -1,18 +1,17 @@
-"""Continuous motor planner — replaces blocking Bezier aim paths.
+"""Continuous motor planner — models human motor control & reaching submovements.
 
-Models distinct motor behaviors:
-- Large target acquisition (ballistic flick)
-- Small correction (micro-adjust)
-- Continuous tracking (smooth pursuit)
-- Camera scanning (deliberate look)
-- Recoil compensation (counter-pull)
+Models distinct motor phases according to human motor research:
+1. Primary movement (ballistic flick with bell-shaped velocity profile)
+2. Deceleration and visual assessment
+3. Discrete corrective submovements (0, 1, or 2 based on personality and distance)
+4. Smooth pursuit tracking with velocity lead and realistic sensory lag
+5. Camera scanning and deliberate reorientation
 
-Each behavior maintains continuous state.  The next movement depends on
-the previous movement, creating temporal continuity rather than
-independently generated trajectories every frame.
-
-All output is non-blocking: the motor system produces a (dx, dy) delta
-to apply THIS TICK, not a blocking sequence of movements.
+Units are strictly defined and converted:
+- Screen error: screen pixels
+- Target velocity: screen pixels per second
+- Motor command: raw mouse counts (integer SendInput relative movements)
+- Time: seconds (dt)
 """
 
 from __future__ import annotations
@@ -22,7 +21,7 @@ import random
 from typing import TYPE_CHECKING
 
 from src.behavior.player_state import AimPhase, MotorPhase
-from src.utils.math_helpers import bbox_to_aim_point, screen_delta_to_mouse
+from src.utils.math_helpers import screen_delta_to_mouse
 
 if TYPE_CHECKING:
     from src.behavior.personality import PersonalityTraits
@@ -30,11 +29,11 @@ if TYPE_CHECKING:
 
 
 class MotorPlanner:
-    """Non-blocking continuous motor system for aiming.
+    """Non-blocking continuous motor system executing structured motor episodes.
 
-    Every tick, call ``plan()`` to get the mouse delta to apply.
-    The planner maintains internal velocity, error, and phase state
-    that persists across frames.
+    Every tick, call ``plan()`` to obtain this tick's integer (dx, dy) mouse counts.
+    The planner executes an active MotorEpisode across multiple frames rather than
+    resampling trajectories on each 30Hz tick.
     """
 
     def __init__(
@@ -58,264 +57,236 @@ class MotorPlanner:
         self.personality = personality
 
         # ── Persistent motor state ───────────────────────────────────────
-        self._velocity_x: float = 0.0
-        self._velocity_y: float = 0.0
-        self._residual_x: float = 0.0
-        self._residual_y: float = 0.0
-        self._prev_error_x: float = 0.0
-        self._prev_error_y: float = 0.0
-        self._overshoot_active: bool = False
-        self._overshoot_correction_pending: bool = False
-        self._settle_ticks: int = 0
-        # Short-term motor tendency (drift): slight consistent bias in aim.
-        self._bias_x: float = random.gauss(0, 0.3)
-        self._bias_y: float = random.gauss(0, 0.2)
+        self._velocity_x: float = 0.0  # mouse counts / tick
+        self._velocity_y: float = 0.0  # mouse counts / tick
+        self._residual_x: float = 0.0  # sub-pixel mouse remainder
+        self._residual_y: float = 0.0  # sub-pixel mouse remainder
+
+        # Persistent motor bias (drifts slowly over seconds, models hand posture)
+        self._bias_x: float = random.gauss(0, 0.2)
+        self._bias_y: float = random.gauss(0, 0.15)
+        self._prev_error_counts: tuple[float, float] = (0.0, 0.0)
 
     def plan(self, state: PlayerState) -> tuple[int, int]:
-        """Compute this tick's mouse delta based on current aim/motor state.
+        """Compute this tick's mouse counts delta based on current aim state.
 
-        Returns (dx, dy) in raw mouse counts to apply via SendInput.
+        Returns (dx, dy) in raw integer mouse counts.
         """
         aim = state.aim_phase
 
-        if aim == AimPhase.IDLE or aim == AimPhase.REACTING:
-            # Not moving the mouse toward a target.
+        if aim in (AimPhase.IDLE, AimPhase.REACTING):
             self._decay_velocity()
-            return self._idle_micro_jitter(state)
+            return self._idle_micro_steadiness(state)
 
         target = state.primary_target
         if target is None:
             self._decay_velocity()
             return (0, 0)
 
-        # Compute screen-space error to target.
-        err_x, err_y, err_dist, mouse_dx, mouse_dy = self._compute_error(target, state)
+        # Ensure authoritative aim matches the current primary target
+        d = target.detection
+        w = max(1.0, d.x2 - d.x1)
+        h = max(1.0, d.y2 - d.y1)
+        if not target.aim_preference:
+            head_choice = random.random() < self.personality.head_aim_preference
+            target.aim_preference = "head" if head_choice else "chest"
+            target.aim_offset_ratio = (0.5, 0.18) if head_choice else (0.5, 0.45)
+        rx, ry = target.aim_offset_ratio
+        aim_x = d.x1 + w * rx
+        aim_y = d.y1 + h * ry
 
-        # Store error for tracking derivative.
-        state.current_aim_error = (err_x, err_y)
+        if (
+            not state.authoritative_aim.is_valid
+            or state.authoritative_aim.target_id != target.target_id
+            or abs(state.authoritative_aim.aim_point_screen[0] - aim_x) > 1.0
+            or abs(state.authoritative_aim.aim_point_screen[1] - aim_y) > 1.0
+        ):
+            err_x = aim_x - self.cx
+            err_y = aim_y - self.cy
+            err_dist = math.hypot(err_x, err_y)
+            mdx, mdy = screen_delta_to_mouse(
+                err_x,
+                err_y,
+                self.sensitivity,
+                self.m_yaw,
+                self.m_pitch,
+                self.screen_w,
+                self.screen_h,
+                self.fov_h,
+            )
+            state.authoritative_aim.target_id = target.target_id
+            state.authoritative_aim.aim_point_screen = (aim_x, aim_y)
+            state.authoritative_aim.screen_error = (err_x, err_y)
+            state.authoritative_aim.screen_error_dist = err_dist
+            state.authoritative_aim.motor_error = (float(mdx), float(mdy))
+            state.authoritative_aim.aim_preference = target.aim_preference
+            state.authoritative_aim.is_valid = True
+
+        # Authoritative error already computed once for the tick
+        auth_aim = state.authoritative_aim
+        mouse_dx, mouse_dy = auth_aim.motor_error
+        err_dist_px = auth_aim.screen_error_dist
 
         if aim == AimPhase.ACQUIRING:
-            return self._acquisition_move(state, mouse_dx, mouse_dy, err_dist)
+            return self._execute_acquisition_episode(state, mouse_dx, mouse_dy, err_dist_px)
         elif aim == AimPhase.CORRECTING:
-            return self._correction_move(state, mouse_dx, mouse_dy, err_dist)
+            return self._execute_correction_submovement(state, mouse_dx, mouse_dy, err_dist_px)
         elif aim == AimPhase.TRACKING:
-            return self._tracking_move(state, target, mouse_dx, mouse_dy, err_dist)
+            return self._execute_tracking_pursuit(state, target, mouse_dx, mouse_dy, err_dist_px)
         elif aim == AimPhase.REACQUIRING:
-            return self._reacquisition_move(state, mouse_dx, mouse_dy, err_dist)
+            return self._execute_reacquisition(state, mouse_dx, mouse_dy, err_dist_px)
 
         return (0, 0)
 
-    def plan_scan(self, dx: float, dy: float, state: PlayerState) -> tuple[int, int]:
-        """Plan a scanning/camera movement."""
+    def plan_scan(self, dx_counts: float, dy_counts: float, state: PlayerState) -> tuple[int, int]:
+        """Plan a purposeful camera movement."""
         state.motor_phase = MotorPhase.SCANNING_TURN
-        # Smooth the scan with velocity blending.
-        alpha = 0.3
-        self._velocity_x = self._velocity_x * (1 - alpha) + dx * alpha
-        self._velocity_y = self._velocity_y * (1 - alpha) + dy * alpha
+        # Smooth camera blend using actual dt
+        alpha = min(1.0, max(0.1, state.tick_dt * 12.0))
+        self._velocity_x = self._velocity_x * (1.0 - alpha) + dx_counts * alpha
+        self._velocity_y = self._velocity_y * (1.0 - alpha) + dy_counts * alpha
         return self._emit(self._velocity_x, self._velocity_y)
 
-    # ── Motor behaviors ──────────────────────────────────────────────────
+    # ── Episode-driven Motor Behaviors ───────────────────────────────────
 
-    def _acquisition_move(
-        self, state: PlayerState, mouse_dx: float, mouse_dy: float, err_dist: float
+    def _execute_acquisition_episode(
+        self,
+        state: PlayerState,
+        mouse_dx: float,
+        mouse_dy: float,
+        err_dist_px: float,
     ) -> tuple[int, int]:
-        """Large ballistic flick toward target.
-
-        Uses velocity-based approach: ramp up, coast, decelerate.
-        The flick doesn't try to land perfectly — it gets close and
-        transitions to correction phase.
-        """
+        """Execute a multi-tick reaching movement with bell-shaped velocity profile."""
         p = self.personality
+        episode = state.motor_episode
+        now = state.now
+
+        # 1. Initialize episode if not active
+        if not episode.active:
+            episode.active = True
+            episode.start_time = now
+            # Plan duration based on Fitts's law / personality motor speed
+            duration = p.sample_motor_duration(err_dist_px)
+            episode.duration = max(0.066, duration)
+            episode.start_error_counts = (mouse_dx, mouse_dy)
+            episode.target_displacement_counts = (mouse_dx, mouse_dy)
+            episode.phase = "primary"
+            episode.submovements_planned = (
+                1 if (p.motor_precision > 0.65 and err_dist_px < 80) else 2
+            )
+            episode.submovements_completed = 0
+            episode.accepted_error_px = 7.0 + (1.0 - p.motor_precision) * 15.0
+
+        # 2. Progress through primary movement
+        elapsed = now - episode.start_time
+        progress = min(1.0, elapsed / episode.duration)
+        state.motor_progress = progress
         state.motor_phase = MotorPhase.FLICKING
 
-        # Target velocity: cover the remaining distance over a personality-
-        # dependent duration.
-        duration = p.sample_motor_duration(err_dist)
-        if duration < 0.001:
-            duration = 0.033  # at least one tick
+        # Bell-shaped velocity weighting (minimum jerk trajectory profile)
+        # Velocity curve: 30 * t^2 * (1-t)^2 normalized
+        vel_weight = 30.0 * (progress**2) * ((1.0 - progress) ** 2)
+        # Fraction of remaining distance to traverse this tick
+        fraction = max(0.15, min(0.95, vel_weight * state.tick_dt * 8.0 + 0.2))
 
-        ticks_remaining = max(1.0, duration / max(state.tick_dt, 0.001))
+        # Primary movement towards target
+        target_vx = mouse_dx * fraction
+        target_vy = mouse_dy * fraction
 
-        # How much to move this tick: proportional control with momentum.
-        gain = min(0.6 + p.motor_speed * 0.3, 0.95)
-        target_vx = mouse_dx * gain / ticks_remaining
-        target_vy = mouse_dy * gain / ticks_remaining
+        # Signal-dependent motor noise (proportional to movement amplitude)
+        speed = math.hypot(target_vx, target_vy)
+        sd_noise = speed * (1.0 - p.motor_precision) * 0.08
+        target_vx += random.gauss(0, sd_noise) + self._bias_x * 0.3
+        target_vy += random.gauss(0, sd_noise) + self._bias_y * 0.3
 
-        # Blend with current velocity for smooth acceleration.
-        blend = 0.4 + p.motor_speed * 0.2
-        self._velocity_x = self._velocity_x * (1 - blend) + target_vx * blend
-        self._velocity_y = self._velocity_y * (1 - blend) + target_vy * blend
+        # Blend with current momentum for physical continuity
+        blend = min(0.85, 0.4 + p.motor_speed * 0.3)
+        self._velocity_x = self._velocity_x * (1.0 - blend) + target_vx * blend
+        self._velocity_y = self._velocity_y * (1.0 - blend) + target_vy * blend
 
-        # Apply imprecision based on personality.
-        imprecision = (1.0 - p.motor_precision) * 2.0
-        self._velocity_x += random.gauss(0, imprecision) + self._bias_x
-        self._velocity_y += random.gauss(0, imprecision * 0.7) + self._bias_y
-
-        # Overshoot decision (once per acquisition, not every frame).
-        if (
-            not self._overshoot_active
-            and not self._overshoot_correction_pending
-            and err_dist > 50
-            and random.random() < p.overshoot_tendency
-        ):
-            self._overshoot_active = True
-            overshoot_factor = 1.0 + random.uniform(0.05, 0.25) * (1.0 - p.motor_precision)
-            self._velocity_x *= overshoot_factor
-            self._velocity_y *= overshoot_factor
-
-        # Transition to correction when close enough.
-        threshold = 30 + (1.0 - p.motor_precision) * 40
-        if err_dist < threshold:
+        # Check primary movement completion / transition to evaluation
+        if progress >= 0.85 or err_dist_px <= max(25.0, episode.accepted_error_px * 2.0):
+            episode.phase = "evaluating"
             state.aim_phase = AimPhase.CORRECTING
             state.motor_phase = MotorPhase.SETTLING
-            self._settle_ticks = 0
-            if self._overshoot_active:
-                self._overshoot_active = False
-                self._overshoot_correction_pending = True
+            episode.correction_start_time = now
+            episode.correction_duration = random.uniform(0.08, 0.14)
+            episode.correction_vector = (mouse_dx, mouse_dy)
 
-        result = self._emit(self._velocity_x, self._velocity_y)
-        self._prev_error_x, self._prev_error_y = mouse_dx, mouse_dy
-        return result
+        return self._emit(self._velocity_x, self._velocity_y)
 
-    def _correction_move(
-        self, state: PlayerState, mouse_dx: float, mouse_dy: float, err_dist: float
+    def _execute_correction_submovement(
+        self,
+        state: PlayerState,
+        mouse_dx: float,
+        mouse_dy: float,
+        err_dist_px: float,
     ) -> tuple[int, int]:
-        """Small corrections after initial acquisition.
-
-        Slower, more precise movements.  Uses error derivative for
-        damping (PD-like behavior).
-        """
+        """Execute a discrete corrective submovement (not continuous random jitter)."""
         p = self.personality
-        self._settle_ticks += 1
+        episode = state.motor_episode
+        now = state.now
         state.motor_phase = MotorPhase.MICRO_CORRECTING
 
-        if err_dist < 5:
-            # Close enough — transition to tracking.
+        # Check if error is within human acceptance threshold
+        if err_dist_px <= episode.accepted_error_px:
+            # Reached acceptable accuracy -> transition to tracking
+            episode.submovements_completed += 1
+            episode.active = False
             state.aim_phase = AimPhase.TRACKING
-            self._overshoot_correction_pending = False
             self._velocity_x *= 0.3
             self._velocity_y *= 0.3
             return self._emit(self._velocity_x, self._velocity_y)
 
-        # Proportional term.
-        kp = 0.15 + p.correction_tendency * 0.25
-        # Derivative term (damping based on error change).
-        kd = 0.05 + p.motor_precision * 0.1
-        d_err_x = mouse_dx - self._prev_error_x
-        d_err_y = mouse_dy - self._prev_error_y
+        # Elapsed time in current corrective submovement
+        corr_elapsed = now - episode.correction_start_time
+        if corr_elapsed >= episode.correction_duration:
+            episode.submovements_completed += 1
+            if episode.submovements_completed >= episode.submovements_planned or err_dist_px < 25.0:
+                # Finished planned submovements -> accept current aim and track
+                episode.active = False
+                state.aim_phase = AimPhase.TRACKING
+                return self._emit(self._velocity_x * 0.4, self._velocity_y * 0.4)
+            else:
+                # Start second corrective submovement
+                episode.correction_start_time = now
+                episode.correction_duration = random.uniform(0.07, 0.12)
+                episode.correction_vector = (mouse_dx, mouse_dy)
 
-        target_vx = mouse_dx * kp - d_err_x * kd
-        target_vy = mouse_dy * kp - d_err_y * kd
+        # Smooth, damped submovement toward target
+        kp = 0.20 + p.correction_tendency * 0.25
+        target_vx = mouse_dx * kp
+        target_vy = mouse_dy * kp
 
-        # Smooth blend.
-        blend = 0.5
-        self._velocity_x = self._velocity_x * (1 - blend) + target_vx * blend
-        self._velocity_y = self._velocity_y * (1 - blend) + target_vy * blend
+        blend = 0.45
+        self._velocity_x = self._velocity_x * (1.0 - blend) + target_vx * blend
+        self._velocity_y = self._velocity_y * (1.0 - blend) + target_vy * blend
 
-        # Less noise during correction.
-        noise_scale = (1.0 - p.motor_precision) * 0.5
-        self._velocity_x += random.gauss(0, noise_scale)
-        self._velocity_y += random.gauss(0, noise_scale * 0.7)
+        return self._emit(self._velocity_x, self._velocity_y)
 
-        # If we've been correcting too long, accept imperfect aim.
-        if self._settle_ticks > 15:
-            state.aim_phase = AimPhase.TRACKING
-
-        result = self._emit(self._velocity_x, self._velocity_y)
-        self._prev_error_x, self._prev_error_y = mouse_dx, mouse_dy
-        return result
-
-    def _tracking_move(
+    def _execute_tracking_pursuit(
         self,
         state: PlayerState,
         target: TrackedTarget,
         mouse_dx: float,
         mouse_dy: float,
-        err_dist: float,
+        err_dist_px: float,
     ) -> tuple[int, int]:
-        """Continuous smooth pursuit tracking.
-
-        Maintains aim on a moving target by predicting target movement
-        and applying smooth corrections.  Error slowly drifts and
-        is periodically corrected.
-        """
+        """Continuous smooth pursuit tracking with proper velocity unit conversion."""
         p = self.personality
         state.motor_phase = MotorPhase.SMOOTH_TRACKING
 
-        # Predict target movement from velocity.
-        vx, vy = target.velocity_estimate
-        pred_factor = state.tick_dt * p.tracking_steadiness * 0.5
+        # ── Unit Conversion: Convert target velocity (px/sec) to mouse counts / tick ──
+        # Target velocity is estimated in screen pixels/second
+        vx_px_s, vy_px_s = target.velocity_estimate
+        # Screen displacement in pixels over one tick
+        disp_x_px = vx_px_s * state.tick_dt
+        disp_y_px = vy_px_s * state.tick_dt
 
-        # Tracking gain: how aggressively to follow.
-        tracking_gain = 0.1 + p.tracking_steadiness * 0.15
-
-        target_vx = mouse_dx * tracking_gain + vx * pred_factor
-        target_vy = mouse_dy * tracking_gain + vy * pred_factor
-
-        # Smooth blend (more than acquisition for stability).
-        blend = 0.3 + p.tracking_steadiness * 0.2
-        self._velocity_x = self._velocity_x * (1 - blend) + target_vx * blend
-        self._velocity_y = self._velocity_y * (1 - blend) + target_vy * blend
-
-        # Tracking jitter — represents hand tremor during tracking.
-        tremor = (1.0 - p.tracking_steadiness) * 1.5
-        self._velocity_x += random.gauss(0, tremor) + self._bias_x * 0.3
-        self._velocity_y += random.gauss(0, tremor * 0.7) + self._bias_y * 0.3
-
-        # If error grows too large, switch back to correction.
-        if err_dist > 60 + (1.0 - p.motor_precision) * 40:
-            state.aim_phase = AimPhase.CORRECTING
-            self._settle_ticks = 0
-
-        result = self._emit(self._velocity_x, self._velocity_y)
-        self._prev_error_x, self._prev_error_y = mouse_dx, mouse_dy
-        return result
-
-    def _reacquisition_move(
-        self, state: PlayerState, mouse_dx: float, mouse_dy: float, err_dist: float
-    ) -> tuple[int, int]:
-        """Re-acquiring a briefly lost target.
-
-        Faster than initial acquisition since we have recent memory.
-        """
-        p = self.personality
-        state.motor_phase = MotorPhase.FLICKING
-
-        gain = 0.4 + p.motor_speed * 0.3
-        target_vx = mouse_dx * gain
-        target_vy = mouse_dy * gain
-
-        blend = 0.5
-        self._velocity_x = self._velocity_x * (1 - blend) + target_vx * blend
-        self._velocity_y = self._velocity_y * (1 - blend) + target_vy * blend
-
-        if err_dist < 30:
-            state.aim_phase = AimPhase.TRACKING
-
-        result = self._emit(self._velocity_x, self._velocity_y)
-        self._prev_error_x, self._prev_error_y = mouse_dx, mouse_dy
-        return result
-
-    # ── Helpers ───────────────────────────────────────────────────────────
-
-    def _compute_error(
-        self, target: TrackedTarget, state: PlayerState
-    ) -> tuple[float, float, float, float, float]:
-        """Compute screen-space error and mouse-count delta to target.
-
-        Returns (err_x_px, err_y_px, err_dist_px, mouse_dx, mouse_dy).
-        """
-        head_aim = random.random() < self.personality.head_aim_preference
-        d = target.detection
-        aim_x, aim_y = bbox_to_aim_point(d.x1, d.y1, d.x2, d.y2, head_aim=head_aim)
-
-        err_x = aim_x - self.cx
-        err_y = aim_y - self.cy
-        err_dist = math.sqrt(err_x * err_x + err_y * err_y)
-
-        mouse_dx, mouse_dy = screen_delta_to_mouse(
-            err_x,
-            err_y,
+        # Convert screen displacement pixels into mouse counts
+        lead_mouse_x, lead_mouse_y = screen_delta_to_mouse(
+            disp_x_px,
+            disp_y_px,
             self.sensitivity,
             self.m_yaw,
             self.m_pitch,
@@ -324,7 +295,60 @@ class MotorPlanner:
             self.fov_h,
         )
 
-        return err_x, err_y, err_dist, float(mouse_dx), float(mouse_dy)
+        # Human tracking lead factor (skilled players predict ahead; casual players lag)
+        lead_gain = 0.4 + p.tracking_steadiness * 0.5
+        tracking_gain = 0.12 + p.tracking_steadiness * 0.16
+
+        # Velocity in mouse counts
+        target_vx = mouse_dx * tracking_gain + float(lead_mouse_x) * lead_gain
+        target_vy = mouse_dy * tracking_gain + float(lead_mouse_y) * lead_gain
+
+        # Inertial smoothing
+        blend = 0.35 + p.tracking_steadiness * 0.20
+        self._velocity_x = self._velocity_x * (1.0 - blend) + target_vx * blend
+        self._velocity_y = self._velocity_y * (1.0 - blend) + target_vy * blend
+
+        # Small physiological tremor (correlated, not white noise)
+        tremor_scale = (1.0 - p.tracking_steadiness) * 0.4
+        self._velocity_x += self._bias_x * tremor_scale
+        self._velocity_y += self._bias_y * tremor_scale
+
+        # If tracking error exceeds threshold, trigger a corrective submovement
+        if err_dist_px > (45.0 + (1.0 - p.motor_precision) * 35.0):
+            state.aim_phase = AimPhase.CORRECTING
+            state.motor_episode.active = True
+            state.motor_episode.correction_start_time = state.now
+            state.motor_episode.correction_duration = 0.10
+            state.motor_episode.submovements_planned = 1
+            state.motor_episode.submovements_completed = 0
+
+        return self._emit(self._velocity_x, self._velocity_y)
+
+    def _execute_reacquisition(
+        self,
+        state: PlayerState,
+        mouse_dx: float,
+        mouse_dy: float,
+        err_dist_px: float,
+    ) -> tuple[int, int]:
+        """Fast re-acquisition of a briefly lost target."""
+        p = self.personality
+        state.motor_phase = MotorPhase.FLICKING
+
+        gain = 0.35 + p.motor_speed * 0.3
+        target_vx = mouse_dx * gain
+        target_vy = mouse_dy * gain
+
+        blend = 0.5
+        self._velocity_x = self._velocity_x * (1.0 - blend) + target_vx * blend
+        self._velocity_y = self._velocity_y * (1.0 - blend) + target_vy * blend
+
+        if err_dist_px < 25.0:
+            state.aim_phase = AimPhase.TRACKING
+
+        return self._emit(self._velocity_x, self._velocity_y)
+
+    # ── Helpers ───────────────────────────────────────────────────────────
 
     def _emit(self, vx: float, vy: float) -> tuple[int, int]:
         """Convert float velocity to integer mouse counts with residual tracking."""
@@ -338,22 +362,19 @@ class MotorPlanner:
 
     def _decay_velocity(self) -> None:
         """Gradually decay velocity when not aiming."""
-        self._velocity_x *= 0.7
-        self._velocity_y *= 0.7
+        self._velocity_x *= 0.6
+        self._velocity_y *= 0.6
 
-    def _idle_micro_jitter(self, state: PlayerState) -> tuple[int, int]:
-        """Very slight jitter when idle (hand tremor)."""
+    def _idle_micro_steadiness(self, state: PlayerState) -> tuple[int, int]:
+        """Hand steadiness during idle / reaction (no twitching)."""
         p = self.personality
-        if random.random() < 0.3:
-            jx = random.gauss(0, 0.3 * (1.0 - p.motor_precision))
-            jy = random.gauss(0, 0.2 * (1.0 - p.motor_precision))
-            return self._emit(jx, jy)
-        return (0, 0)
+        # Drift motor bias slowly
+        self._bias_x += random.gauss(0, 0.02)
+        self._bias_y += random.gauss(0, 0.015)
+        self._bias_x *= 0.95
+        self._bias_y *= 0.95
 
-    def drift_bias(self) -> None:
-        """Slowly drift the motor bias (called periodically)."""
-        self._bias_x += random.gauss(0, 0.05)
-        self._bias_y += random.gauss(0, 0.03)
-        # Mean-revert.
-        self._bias_x *= 0.98
-        self._bias_y *= 0.98
+        if random.random() < 0.15:
+            scale = 0.2 * (1.0 - p.motor_precision)
+            return self._emit(self._bias_x * scale, self._bias_y * scale)
+        return (0, 0)

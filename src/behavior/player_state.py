@@ -1,10 +1,10 @@
 """Central persistent player-behavior state.
 
-Maintains meaningful state across frames and actions.  Every subsystem
+Maintains meaningful state across frames and actions. Every subsystem
 reads from and writes to this shared state, ensuring that decisions,
 motor actions, firing, and movement are all coherent.
 
-Nothing here is reset every frame.  Resets happen only on death/respawn
+Nothing here is reset every frame. Resets happen only on death/respawn
 or explicit state transitions.
 """
 
@@ -30,6 +30,7 @@ class BotPhase(Enum):
     ENGAGING = auto()
     TRACKING = auto()
     RETREATING = auto()
+    RELOADING = auto()
 
 
 class AimPhase(Enum):
@@ -79,6 +80,89 @@ class MovementPhase(Enum):
     PAUSING = auto()
 
 
+# ── Action / Episode records ──────────────────────────────────────────────────
+
+
+@dataclass
+class AuthoritativeAim:
+    """Single authoritative aim state consumed by motor planning, firing, and logging."""
+
+    target_id: int = -1
+    aim_point_screen: tuple[float, float] = (0.0, 0.0)
+    screen_error: tuple[float, float] = (0.0, 0.0)
+    screen_error_dist: float = 999.0
+    motor_error: tuple[float, float] = (0.0, 0.0)
+    aim_preference: str = "chest"  # "head", "chest", "center"
+    is_valid: bool = False
+
+
+@dataclass
+class MotorEpisode:
+    """Persistent motor plan for an acquisition / correction episode."""
+
+    active: bool = False
+    start_time: float = 0.0
+    duration: float = 0.0
+    start_error_counts: tuple[float, float] = (0.0, 0.0)
+    target_displacement_counts: tuple[float, float] = (0.0, 0.0)
+    phase: str = (
+        "idle"  # "primary", "decelerating", "evaluating", "corrective", "settling", "pursuit"
+    )
+    submovements_planned: int = 1
+    submovements_completed: int = 0
+    correction_start_time: float = 0.0
+    correction_duration: float = 0.0
+    correction_vector: tuple[float, float] = (0.0, 0.0)
+    accepted_error_px: float = 12.0
+
+
+@dataclass
+class FiringEpisode:
+    """Committed firing episode preventing tick-by-tick mode flapping."""
+
+    active: bool = False
+    mode: str = "none"  # "tap", "burst", "spray"
+    start_time: float = 0.0
+    shots_planned: int = 0
+    shots_fired: int = 0
+    pause_until: float = 0.0
+    cooldown_until: float = 0.0
+
+
+@dataclass
+class CrouchEpisode:
+    """Persistent crouch episode avoiding 30Hz key fluttering."""
+
+    is_crouching: bool = False
+    start_time: float = 0.0
+    duration: float = 0.0
+    cooldown_until: float = 0.0
+
+
+@dataclass
+class ReloadEpisode:
+    """Persistent reload episode machine."""
+
+    is_reloading: bool = False
+    start_time: float = 0.0
+    expected_duration: float = 2.6
+    key_pressed: bool = False
+    grace_until: float = 0.0
+
+
+@dataclass
+class SpatialMemory:
+    """Persistent directional memory of an enemy with true last_seen timestamp."""
+
+    screen_x: float
+    screen_y: float
+    yaw_offset_deg: float
+    pitch_offset_deg: float
+    last_seen_time: float
+    confidence: float
+    velocity: tuple[float, float] = (0.0, 0.0)
+
+
 # ── Target record ────────────────────────────────────────────────────────────
 
 
@@ -87,18 +171,27 @@ class TrackedTarget:
     """Everything the player knows/remembers about a specific target."""
 
     detection: Detection  # most recent detection
+    target_id: int = 0  # unique ID for target identity
     first_seen: float = 0.0  # time first noticed
     last_seen: float = 0.0  # time last detected
     frames_visible: int = 0  # consecutive frames visible
     frames_missing: int = 0  # consecutive frames NOT visible
     position_history: deque = field(default_factory=lambda: deque(maxlen=30))
-    velocity_estimate: tuple[float, float] = (0.0, 0.0)
+    velocity_estimate: tuple[float, float] = (0.0, 0.0)  # in screen pixels per second
     is_primary: bool = False  # currently the focused target
     engagement_time: float = 0.0  # how long we've been fighting this one
     shots_at: int = 0  # shots fired at this target
     hits_estimated: int = 0  # estimated hits
     threat_level: float = 0.0  # current threat score
     last_switch_reason: str = ""  # why we switched to/from this target
+
+    # Persistent aim preference: decided upon acquisition, never rerolled every tick!
+    aim_preference: str = ""  # "head" or "chest"
+    aim_offset_ratio: tuple[float, float] = (
+        0.5,
+        0.2,
+    )  # Relative (x, y) offset within detection bbox
+    initial_error_dist: float = 0.0
 
     def update_position(self, cx: float, cy: float, now: float) -> None:
         """Record a new position observation."""
@@ -107,14 +200,19 @@ class TrackedTarget:
         self.frames_visible += 1
         self.frames_missing = 0
 
-        # Estimate velocity from recent positions
+        # Estimate velocity from recent positions (screen pixels / second)
         if len(self.position_history) >= 3:
             p_old = self.position_history[-3]
             dt = now - p_old[2]
             if dt > 0.001:
+                # Exponential smoothing of velocity
+                new_vx = (cx - p_old[0]) / dt
+                new_vy = (cy - p_old[1]) / dt
+                old_vx, old_vy = self.velocity_estimate
+                alpha = 0.4
                 self.velocity_estimate = (
-                    (cx - p_old[0]) / dt,
-                    (cy - p_old[1]) / dt,
+                    old_vx * (1 - alpha) + new_vx * alpha,
+                    old_vy * (1 - alpha) + new_vy * alpha,
                 )
 
     def mark_missing(self) -> None:
@@ -130,7 +228,7 @@ class PlayerState:
     """Central persistent state for the simulated player.
 
     This object is the single source of truth for the player's current
-    situation.  All behavioral subsystems read and write through it.
+    situation. All behavioral subsystems read and write through it.
     """
 
     def __init__(self):
@@ -154,11 +252,16 @@ class PlayerState:
         self.attention_confidence: float = 0.0  # 0=unfocused, 1=locked
         self.peripheral_alerts: deque = deque(maxlen=5)
         self.last_enemy_positions: deque = deque(maxlen=10)
+        self.spatial_memories: deque[SpatialMemory] = deque(maxlen=10)
         self.awareness_level: float = 0.5  # 0=oblivious, 1=hyper-alert
 
-        # ── Aim / motor state ────────────────────────────────────────────
+        # ── Authoritative Aim state (shared across all subsystems) ───────
+        self.authoritative_aim: AuthoritativeAim = AuthoritativeAim()
+
+        # ── Aim / motor state & episodes ─────────────────────────────────
         self.aim_phase: AimPhase = AimPhase.IDLE
         self.motor_phase: MotorPhase = MotorPhase.IDLE
+        self.motor_episode: MotorEpisode = MotorEpisode()
         self.current_aim_error: tuple[float, float] = (0.0, 0.0)
         self.previous_aim_error: tuple[float, float] = (0.0, 0.0)
         self.motor_velocity: tuple[float, float] = (0.0, 0.0)
@@ -168,8 +271,11 @@ class PlayerState:
         self.motor_phase_duration: float = 0.0
         self.motor_progress: float = 0.0  # 0..1 through current phase
 
-        # ── Firing state ─────────────────────────────────────────────────
+        # ── Firing state & episodes ──────────────────────────────────────
         self.firing_phase: FiringPhase = FiringPhase.NOT_FIRING
+        self.firing_episode: FiringEpisode = FiringEpisode()
+        self.crouch_episode: CrouchEpisode = CrouchEpisode()
+        self.reload_episode: ReloadEpisode = ReloadEpisode()
         self.is_trigger_held: bool = False
         self.shot_count: int = 0  # actual shots this spray
         self.burst_shot_target: int = 0  # target shots for current burst
@@ -191,6 +297,7 @@ class PlayerState:
         self.movement_duration: float = 0.0  # planned duration
         self.held_keys: set[str] = set()
         self.is_crouching: bool = False
+        self.recent_movement_tendencies: deque = deque(maxlen=10)
 
         # ── Health / HUD ─────────────────────────────────────────────────
         self.health: int = 100
@@ -205,7 +312,7 @@ class PlayerState:
         self.reaction_duration: float = 0.0
         self.reaction_context: str = ""
         self.recent_reaction_times: deque = deque(maxlen=10)
-        self.reaction_tendency: float = 1.0  # short-term multiplier
+        self.reaction_tendency: float = 1.0  # unified short-term multiplier (drifts slowly)
 
         # ── Confidence / adaptation ──────────────────────────────────────
         self.confidence: float = 0.5
@@ -230,7 +337,7 @@ class PlayerState:
     def begin_tick(self) -> None:
         """Call at the start of every main-loop tick."""
         now = time.perf_counter()
-        self.tick_dt = now - self._now
+        self.tick_dt = max(0.001, min(0.2, now - self._now))
         self._now = now
         self.frame_count += 1
         self.last_tick_time = now
@@ -252,10 +359,15 @@ class PlayerState:
     # ── Death / respawn ──────────────────────────────────────────────────
 
     def on_death(self) -> None:
-        """Reset combat state on death.  Keep personality-level memories."""
+        """Reset combat state on death. Keep personality-level memories."""
         self.transition_phase(BotPhase.DEAD)
         self.primary_target = None
         self.known_targets.clear()
+        self.authoritative_aim = AuthoritativeAim()
+        self.motor_episode = MotorEpisode()
+        self.firing_episode = FiringEpisode()
+        self.crouch_episode = CrouchEpisode()
+        self.reload_episode = ReloadEpisode()
         self.aim_phase = AimPhase.IDLE
         self.motor_phase = MotorPhase.IDLE
         self.firing_phase = FiringPhase.NOT_FIRING
@@ -275,9 +387,15 @@ class PlayerState:
         """Transition from dead to alive."""
         self.transition_phase(BotPhase.ROAMING)
         self.health = 100
+        self.ammo_clip = 30
         self.is_alive = True
         self.awareness_level = 0.5
         self.confidence = max(0.3, self.confidence * 0.9)  # slight reset, not full
+        self.authoritative_aim = AuthoritativeAim()
+        self.motor_episode = MotorEpisode()
+        self.firing_episode = FiringEpisode()
+        self.crouch_episode = CrouchEpisode()
+        self.reload_episode = ReloadEpisode()
 
     # ── Firing events ────────────────────────────────────────────────────
 
@@ -315,7 +433,11 @@ class PlayerState:
             new_target.last_switch_reason = reason
         self.target_switch_history.append((self._now, reason))
         self.target_acquisition_time = self._now
-        # Reset firing state on target switch
+
+        # Reset episode states on target switch
+        self.authoritative_aim = AuthoritativeAim()
+        self.motor_episode = MotorEpisode()
+        self.firing_episode = FiringEpisode()
         self.reset_spray()
 
     # ── Adaptation helpers ───────────────────────────────────────────────

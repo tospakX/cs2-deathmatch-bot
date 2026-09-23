@@ -1,4 +1,11 @@
-"""Main loop orchestrator for the CS2 Deathmatch Bot."""
+"""Main loop orchestrator for the CS2 Deathmatch Bot.
+
+Runs the authoritative behavioral architecture:
+  Screen Capture -> YOLO / Confirmation Filter -> HUD Reader
+  -> PlayerState -> PerceptionSystem -> DecisionEngine
+  -> MotorPlanner -> FiringController -> MovementController
+  -> SendInput (Mouse & Keyboard)
+"""
 
 import ctypes
 import os
@@ -23,21 +30,13 @@ PAUSE_KEY_NAME = "HOME"
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-from src.aim.mouse_mover import MouseMover
-from src.aim.recoil import RecoilCompensator
-from src.aim.targeting import TargetingSystem
 from src.behavior.decision import DecisionEngine
 from src.behavior.motor import MotorPlanner
 from src.behavior.perception import PerceptionSystem
+from src.behavior.personality import load_personality
 from src.behavior.player_state import BotPhase, PlayerState
-from src.brain.decision import Action, DecisionMaker
-from src.brain.priorities import ThreatAssessor
 from src.brain.state_machine import BotState, StateMachine
 from src.capture.screen import ScreenCapture
-from src.humanizer.mistakes import MistakeMaker
-from src.humanizer.noise import NoiseGenerator
-from src.humanizer.personality import load_personality
-from src.humanizer.timing import ReactionTimer
 from src.input import keyboard, mouse
 from src.movement.bc_policy import BCMovementPolicy
 from src.movement.explorer import WallFollower
@@ -46,7 +45,7 @@ from src.movement.stuck_detector import StuckDetector
 from src.utils.debug_overlay import DebugOverlay
 from src.utils.session_logger import SessionLogger
 from src.vision.confirmation_filter import ConfirmationFilter
-from src.vision.detector import Detection, YOLODetector
+from src.vision.detector import YOLODetector
 from src.vision.hud_reader import HUDReader
 from src.vision.minimap import MinimapReader
 
@@ -64,7 +63,7 @@ def load_config(path: str = "config/settings.yaml") -> dict:
 
 
 class Bot:
-    """Main bot orchestrator."""
+    """Main bot orchestrator running the authoritative behavioral pipeline."""
 
     def __init__(self, personality_name: str | None = None):
         self.config = load_config()
@@ -110,14 +109,24 @@ class Bot:
             val_min=mm.get("val_min", 190),
         )
 
-        # Behavioral Core (Persistent simulated human player)
+        # Single Authoritative Behavioral Core
         game = self.config["game"]
         self.player_state = PlayerState()
-        self.perception = PerceptionSystem((game["crosshair_x"], game["crosshair_y"]))
+        self.perception = PerceptionSystem(
+            screen_center=(game["crosshair_x"], game["crosshair_y"]),
+            screen_size=(display["width"], display["height"]),
+            fov_h=game.get("fov_horizontal", 122.0),
+        )
         self.decision_engine = DecisionEngine(
             personality=self.personality,
             screen_center=(game["crosshair_x"], game["crosshair_y"]),
             weapon=game.get("weapon", "default"),
+            sensitivity=game["sensitivity"],
+            m_yaw=game["m_yaw"],
+            m_pitch=game["m_pitch"],
+            fov_h=game.get("fov_horizontal", 122.0),
+            screen_width=display["width"],
+            screen_height=display["height"],
         )
         self.motor_planner = MotorPlanner(
             screen_center=(game["crosshair_x"], game["crosshair_y"]),
@@ -130,32 +139,10 @@ class Bot:
             personality=self.personality,
         )
 
-        # Brain & Aim bridges
+        # State machine bridge for debug overlay & metrics
         self.state_machine = StateMachine()
-        self.decision_maker = DecisionMaker(self.personality)
-        self.threat_assessor = ThreatAssessor((game["crosshair_x"], game["crosshair_y"]))
 
-        # Aim
-        self.targeting = TargetingSystem(
-            game["crosshair_x"],
-            game["crosshair_y"],
-            game["sensitivity"],
-            game["m_yaw"],
-            game["m_pitch"],
-            self.personality.head_aim_chance,
-            fov_horizontal=game.get("fov_horizontal", 122.0),
-            screen_width=display["width"],
-            screen_height=display["height"],
-        )
-        self.mouse_mover = MouseMover(
-            base_speed=self.personality.aim_speed,
-            noise_amplitude=self.personality.tracking_error / 4,
-        )
-        self.recoil = RecoilCompensator(
-            compensation_factor=self.personality.recoil_compensation,
-        )
-
-        # Movement
+        # Movement navigation
         nav_cfg = self.config["navigation"]
         self.explorer = WallFollower(
             wall_threshold=nav_cfg["wall_avoid_threshold"],
@@ -184,22 +171,7 @@ class Bot:
             timeout=nav_cfg["stuck_timeout"],
         )
 
-        # Humanizer
-        p = self.personality
-        self.reaction_timer = ReactionTimer(
-            p.reaction_mean_ms,
-            p.reaction_std_ms,
-            p.reaction_min_ms,
-            p.reaction_max_ms,
-        )
-        self.mistake_maker = MistakeMaker(
-            p.overshoot_chance,
-            p.overshoot_magnitude,
-            p.tracking_error,
-        )
-        self.noise = NoiseGenerator()
-
-        # Debug
+        # Debug overlay
         self.debug = None
         if self.config["bot"]["debug_overlay"]:
             self.debug = DebugOverlay(scale=0.5)
@@ -211,7 +183,7 @@ class Bot:
         )
         self._last_nav_cmd: dict = {}
 
-        # State
+        # Runtime State
         self._is_firing = False
         self._movement_keys_held: set[str] = set()
         self._tick_count = 0
@@ -256,8 +228,8 @@ class Bot:
         self.running = True
         self._loop_start = time.perf_counter()
         self._max_run_seconds = self.config["bot"].get("max_run_seconds", 120)
-        # Dedicated watchdog thread polls the panic key every 20ms, independent
-        # of the (sometimes slow) main loop, and force-exits. Can't be starved.
+
+        # Dedicated watchdog thread polls the panic key every 20ms
         threading.Thread(target=self._panic_watchdog, daemon=True).start()
         print("[Bot] Ready.")
         print(
@@ -284,11 +256,7 @@ class Bot:
                 pass
 
     def _panic_watchdog(self) -> None:
-        """Handle the global hotkeys: END = kill, HOME = pause/resume toggle.
-
-        Runs in its own thread polling every 20ms, so a slow/blocked main loop
-        can never delay it.
-        """
+        """Handle the global hotkeys: END = kill, HOME = pause/resume toggle."""
         user32 = ctypes.windll.user32
         prev_pause_down = False
         while self.running:
@@ -320,7 +288,6 @@ class Bot:
 
     def _should_abort(self) -> bool:
         """True if the panic key is down or the run time limit was hit."""
-        # High bit set => key currently pressed (read globally, focus-independent)
         if ctypes.windll.user32.GetAsyncKeyState(PANIC_VK) & 0x8000:
             print(f"\n[Bot] PANIC key ({PANIC_KEY_NAME}) pressed -- stopping.")
             return True
@@ -371,7 +338,6 @@ class Bot:
             # Check stuck
             is_moving = len(self._movement_keys_held) > 0
             self._is_stuck = self.stuck_detector.update(frame, is_moving)
-            is_stuck = False
 
             # 5. Perception: track detected enemies across frames with persistent identity
             self.perception.update(self.player_state, detections)
@@ -382,7 +348,7 @@ class Bot:
                 else [d for d in detections if not d.is_head]
             )
 
-            # 6. Decision Engine: attention, reaction, firing, movement, adaptation
+            # 6. Authoritative Decision Engine: attention, reaction, firing, movement, adaptation
             decision = self.decision_engine.decide(self.player_state, visible_targets)
 
             # Synchronize state_machine for debug overlay & session logging
@@ -394,25 +360,26 @@ class Bot:
                 BotPhase.TRACKING: BotState.FIGHTING,
                 BotPhase.RETREATING: BotState.RETREATING,
                 BotPhase.SPAWNING: BotState.ROAMING,
+                BotPhase.RELOADING: BotState.ROAMING,
             }
             mapped_state = phase_to_state.get(self.player_state.phase, BotState.ROAMING)
             self.state_machine.state = mapped_state
-            action = Action(decision.action_type)
+            action_name = decision.action_type
 
             # 7. Execute planned behavior (non-blocking motor + shot-based recoil + movement)
-            self._execute_behavior(decision, frame, enemies)
+            self._execute_behavior(decision, frame)
 
-            # 8b. Session logging (cheap; throttled frame saves)
+            # 8. Session logging (cheap; throttled frame saves)
             if self.logger.enabled:
                 nav = self._last_nav_cmd
                 self.logger.log_tick(
                     state=self.state_machine.state.name,
-                    action=action.type,
+                    action=action_name,
                     enemies=len(enemies),
                     health=hud.health,
                     ammo=hud.ammo_clip,
                     alive=hud.is_alive,
-                    stuck=is_stuck,
+                    stuck=self._is_stuck,
                     nav_heading=_round(nav.get("heading_deg")),
                     nav_yaw_err=_round(nav.get("yaw_error_deg")),
                     nav_turn=nav.get("turn_x"),
@@ -427,7 +394,7 @@ class Bot:
                 )
                 self.logger.maybe_save_frame(
                     frame,
-                    label=f"{self.state_machine.state.name} | {action.type} | "
+                    label=f"{self.state_machine.state.name} | {action_name} | "
                     f"en={len(enemies)} hp={hud.health}",
                 )
 
@@ -440,7 +407,7 @@ class Bot:
                     hud_info=str(hud),
                     inference_ms=self.detector.inference_ms,
                     extra_lines=[
-                        f"Action: {action.type}",
+                        f"Action: {action_name}",
                         f"Raw: {len(raw_detections)} | Confirmed: {len(detections)}",
                         f"Stuck recoveries: {self.stuck_detector.recovery_count}",
                     ],
@@ -454,8 +421,8 @@ class Bot:
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
-    def _execute_behavior(self, decision, frame, enemies: list[Detection]) -> None:
-        """Execute the planned actions from the behavioral engine."""
+    def _execute_behavior(self, decision, frame) -> None:
+        """Execute the planned actions from the authoritative behavioral engine."""
         keybinds = self.config["keybinds"]
 
         # 1. Non-blocking continuous motor planning (mouse aiming)
@@ -486,17 +453,19 @@ class Bot:
             mouse.mouse_down("left")
             self._is_firing = True
 
-        # 4. Movement execution
+        # 4. Movement & Reload execution
         if decision.should_reload:
             self._stop_firing()
             keyboard.key_press(keybinds["reload"])
+        elif decision.phase == BotPhase.RELOADING:
+            self._stop_firing()
         elif decision.phase in (BotPhase.ENGAGING, BotPhase.RETREATING):
             self._apply_combat_movement(decision.movement_keys, keybinds)
         elif decision.phase in (BotPhase.ROAMING, BotPhase.SCANNING):
             self._stop_firing()
             self._roam(frame, keybinds)
 
-        # 5. Idle actions
+        # 5. Idle quirks
         if decision.idle_action == "inspect":
             keyboard.key_press(keybinds["inspect"])
 
@@ -515,140 +484,12 @@ class Bot:
                 keyboard.release_key(bind_key)
                 self._movement_keys_held.discard(bind_key)
 
-    def _execute_action(self, action: Action, frame, enemies: list[Detection]) -> None:
-        """Execute a decided action."""
-        keybinds = self.config["keybinds"]
-
-        if action.type == "wait":
-            self._release_all_movement()
-            self._stop_firing()
-
-        elif action.type == "click":
-            mouse.click("left")
-
-        elif action.type == "engage":
-            target = action.params.get("target")
-            fire_mode = action.params.get("fire_mode", "spray")
-            combat_move = action.params.get("combat_move")
-
-            if target:
-                self._aim_at_target(target)
-                self._handle_fire_mode(fire_mode)
-                self._handle_combat_movement(combat_move, keybinds)
-
-        elif action.type == "reload":
-            self._stop_firing()
-            keyboard.key_press(keybinds["reload"])
-
-        elif action.type == "roam":
-            self._stop_firing()
-            self._roam(frame, keybinds)
-
-        elif action.type == "search":
-            self._stop_firing()
-            self._roam(frame, keybinds)
-
-        elif action.type == "check_corner":
-            direction = action.params.get("direction", "left")
-            turn_amount = 8 if direction == "right" else -8
-            mouse.move_relative(turn_amount, 0)
-
-        elif action.type == "flee":
-            self._stop_firing()
-            self._release_all_movement()
-            # Turn away and run
-            enemy = action.params.get("enemy")
-            if enemy:
-                dx, dy, _ = self.targeting.get_aim_delta(enemy)
-                mouse.move_relative(-dx // 4, 0)  # Turn away
-            keyboard.hold_key(keybinds["forward"])
-            self._movement_keys_held.add(keybinds["forward"])
-            if random.random() < 0.3:
-                keyboard.key_press(keybinds["jump"])
-
-        elif action.type == "unstick":
-            phase = action.params.get("phase", "backup")
-            self._handle_unstick(phase, keybinds)
-
-        elif action.type == "inspect_weapon":
-            keyboard.key_press(keybinds["inspect"])
-
-        elif action.type == "look_around":
-            dx = random.randint(-50, 50)
-            dy = random.randint(-15, 15)
-            self.mouse_mover.move_to_delta(dx, dy, duration_ms=200)
-
-        elif action.type == "jump":
-            keyboard.key_press(keybinds["jump"])
-
-    def _aim_at_target(self, target: Detection) -> None:
-        """Aim at a detected enemy with humanization."""
-        if not self.reaction_timer.is_ready():
-            return
-
-        dx, dy, dist = self.targeting.get_aim_delta(target)
-
-        if dist < 30:
-            # Already on target, just apply small correction
-            self.mouse_mover.micro_correct(dx, dy)
-            return
-
-        # Apply aim error
-        aim_x, aim_y = self.mistake_maker.apply_aim_error(dx, dy)
-
-        # Decide overshoot
-        if self.mistake_maker.should_overshoot():
-            aim_x, aim_y = self.mistake_maker.overshoot_target(0, 0, aim_x, aim_y)
-            # Main flick (overshoots)
-            self.mouse_mover.move_to_delta(aim_x, aim_y)
-            # Correction back to target
-            correction_x = dx - aim_x
-            correction_y = dy - aim_y
-            time.sleep(self.personality.correction_delay_ms / 1000)
-            self.mouse_mover.micro_correct(correction_x, correction_y)
-        else:
-            self.mouse_mover.move_to_delta(aim_x, aim_y)
-
-        # Start new reaction timer for next target acquisition
-        if dist > 200:
-            self.reaction_timer.start_reaction()
-
-    def _handle_fire_mode(self, fire_mode: str) -> None:
-        """Handle firing based on fire mode."""
-        if fire_mode == "tap":
-            mouse.click("left", hold_ms=random.uniform(20, 50))
-            self.recoil.reset()
-            self._is_firing = False
-        elif fire_mode == "spray":
-            if not self._is_firing:
-                mouse.mouse_down("left")
-                self._is_firing = True
-            self.recoil.apply()
-        elif fire_mode == "burst_end":
-            self._stop_firing()
-            self.recoil.reset()
-
     def _stop_firing(self) -> None:
         """Stop firing if currently firing."""
         if self._is_firing:
             mouse.mouse_up("left")
             self._is_firing = False
-            self.recoil.reset()
             self.player_state.reset_spray()
-
-    def _handle_combat_movement(self, move: str | None, keybinds: dict) -> None:
-        """Apply combat movement (strafing, crouching)."""
-        if move == "crouch":
-            keyboard.hold_key(keybinds["crouch"])
-            self._movement_keys_held.add(keybinds["crouch"])
-        elif move == "strafe_left":
-            self._release_all_movement()
-            keyboard.hold_key(keybinds["left"])
-            self._movement_keys_held.add(keybinds["left"])
-        elif move == "strafe_right":
-            self._release_all_movement()
-            keyboard.hold_key(keybinds["right"])
-            self._movement_keys_held.add(keybinds["right"])
 
     def _roam(self, frame, keybinds: dict) -> None:
         """Roaming movement with a unified minimap anti-stick for any driver."""
@@ -656,9 +497,6 @@ class Bot:
         self._bc_pos_hist.append(pos)
 
         # Position-stuck: minimap dot frozen while we believe we're moving.
-        # Catches wall-grinding the frame-diff detector misses (a turning view
-        # looks like motion). Recovery is a committed turn-sweep -- never the
-        # old backup-into-wall loop.
         pos_stuck = False
         if len(self._bc_pos_hist) == self._bc_pos_hist.maxlen:
             ox, oy = self._bc_pos_hist[0]
@@ -703,25 +541,9 @@ class Bot:
             mouse.move_relative(turn, 0)
 
     def _smooth_turn(self, target: int) -> int:
-        """Low-pass the view turn so the camera eases instead of jerking each
-        tick (kills the twitchy look). Sustained turns still reach full speed."""
+        """Low-pass the view turn so the camera eases instead of jerking each tick."""
         self._turn_state += (target - self._turn_state) * 0.4
         return int(round(self._turn_state))
-
-    def _handle_unstick(self, phase: str, keybinds: dict) -> None:
-        """Handle stuck recovery phases."""
-        self._release_all_movement()
-
-        if phase == "backup":
-            keyboard.hold_key(keybinds["back"])
-            self._movement_keys_held.add(keybinds["back"])
-        elif phase == "turn":
-            # Turn 90 degrees
-            mouse.move_relative(random.choice([-60, 60]), 0)
-        elif phase == "forward":
-            keyboard.hold_key(keybinds["forward"])
-            self._movement_keys_held.add(keybinds["forward"])
-            self.stuck_detector.reset()
 
     def _release_all_movement(self) -> None:
         """Release all held movement keys."""
