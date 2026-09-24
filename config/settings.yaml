@@ -1,86 +1,99 @@
-# CS2 Deathmatch Bot - Main Settings
-
 display:
-  monitor: 0                    # Monitor index for DXcam
-  width: 3440                   # Game resolution
-  height: 1440
-  capture_fps: 30               # Target capture rate
-
+  monitor: 0
+  width: 1920
+  height: 1080
+  capture_fps: 30
 game:
-  crosshair_x: 1720             # Screen center X
-  crosshair_y: 720              # Screen center Y
-  fov_horizontal: 122           # CS2 FOV adjusted for 3440x1440 ultrawide
-  sensitivity: 0.85             # In-game mouse sensitivity
-  m_yaw: 0.022                  # CS2 default m_yaw
-  m_pitch: 0.022                # CS2 default m_pitch
-
+  crosshair_x: 960
+  crosshair_y: 540
+  fov_horizontal: 106
+  sensitivity: 0.85
+  m_yaw: 0.022
+  m_pitch: 0.022
 regions:
-  # HUD regions (x, y, w, h) - calibrate per resolution
-  health:    [76, 1038, 80, 30]
-  armor:     [186, 1038, 80, 30]
-  ammo_clip: [1780, 1038, 60, 30]
-  ammo_reserve: [1850, 1038, 60, 30]
-  killfeed:  [1400, 50, 500, 200]
-  alive_ct:  [870, 18, 40, 24]
-  alive_t:   [1010, 18, 40, 24]
-
+  health:
+  - 76
+  - 1038
+  - 80
+  - 30
+  armor:
+  - 186
+  - 1038
+  - 80
+  - 30
+  ammo_clip:
+  - 1780
+  - 1038
+  - 60
+  - 30
+  ammo_reserve:
+  - 1850
+  - 1038
+  - 60
+  - 30
+  killfeed:
+  - 1400
+  - 50
+  - 500
+  - 200
+  alive_ct:
+  - 870
+  - 18
+  - 40
+  - 24
+  alive_t:
+  - 1010
+  - 18
+  - 40
+  - 24
 minimap:
   x: 16
   y: 16
   size: 256
-  # Player dot is detected hue-agnostically as the brightest, most-saturated
-  # blob -- CS2 reassigns the blip colour each match (cyan, yellow, ...), so a
-  # fixed hue is unreliable. Map terrain is dull, the dot is bright+saturated.
   sat_min: 150
   val_min: 190
-
 detection:
-  model_path: "models/cs2_yolov8n.onnx"
-  confidence_threshold: 0.30   # lowered from 0.45 to catch partial/peeking + farther targets (more false positives)
+  model_path: models/cs2_yolov8n.onnx
+  confidence_threshold: 0.3
   nms_threshold: 0.5
   input_size: 640
-  classes: ["player"]   # single-class model (best.onnx, 2026-06-16): everyone is an enemy
-
+  classes:
+  - player
 confirmation:
-  min_confirm_frames: 3       # Frames a target must persist before acting
-  max_missing_frames: 2       # Frames a tracker survives without a match
-  match_distance: 150.0       # Max pixel movement between frames
-  match_size_ratio: 0.4       # Min bbox size similarity (0-1)
-
+  min_confirm_frames: 3
+  max_missing_frames: 2
+  match_distance: 150.0
+  match_size_ratio: 0.4
 keybinds:
-  forward: "w"
-  back: "s"
-  left: "a"
-  right: "d"
-  jump: "space"
-  crouch: "ctrl"
-  walk: "shift"
-  reload: "r"
-  use: "e"
-  inspect: "f"
-  drop: "g"
-  buy_menu: "b"
-
+  forward: w
+  back: s
+  left: a
+  right: d
+  jump: space
+  crouch: ctrl
+  walk: shift
+  reload: r
+  use: e
+  inspect: f
+  drop: g
+  buy_menu: b
 bot:
-  tick_rate: 30                  # Main loop Hz
-  default_personality: "average"
+  tick_rate: 30
+  default_personality: average
+  map: dust2
   debug_overlay: true
   debug_log: true
-  max_run_seconds: 120           # Failsafe: auto-stop after N seconds (0 = no limit)
-  movement_mode: "waypoint"      # "waypoint" (reliable nav) or "bc" (learned model, WIP)
-
-# Learned movement policy (used when bot.movement_mode == "bc")
+  max_run_seconds: 120
+  movement_mode: waypoint
 bc_movement:
-  model_path: "models/movement.onnx"
-  mild_turn: 150                 # mouse counts/tick for left/right turn classes
-  hard_turn: 400                 # mouse counts/tick for hard-turn classes
-  invert_turn: false             # flip if the bot turns away from where it should
-
+  model_path: models/movement.onnx
+  mild_turn: 150
+  hard_turn: 400
+  invert_turn: false
 navigation:
-  stuck_timeout: 2.0            # Seconds before stuck recovery
-  waypoint_reach_dist: 50       # Pixels on minimap
-  wall_avoid_threshold: 200     # Depth pixels for wall detection
-  # Waypoint-following controller (calibrate_nav.py --write sets these):
-  nav_turn_gain: 40             # Mouse counts emitted per degree of heading error
-  nav_max_turn: 150             # Per-tick turn clamp = turn speed (~85 deg/s at 30Hz)
-  nav_invert_turn: false        # Flip if the bot consistently turns AWAY from its path
+  stuck_timeout: 2.0
+  waypoint_reach_dist: 50
+  wall_avoid_threshold: 200
+  nav_turn_gain: 40
+  nav_max_turn: 150
+  nav_invert_turn: false

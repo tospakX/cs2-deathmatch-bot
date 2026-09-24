@@ -17,9 +17,9 @@ class TargetingSystem:
         m_yaw: float = 0.022,
         m_pitch: float = 0.022,
         head_aim_chance: float = 0.3,
-        fov_horizontal: float = 90.0,
-        screen_width: int = 3440,
-        screen_height: int = 1440,
+        fov_horizontal: float = 106.0,
+        screen_width: int = 1920,
+        screen_height: int = 1080,
     ):
         self.cx = screen_center_x
         self.cy = screen_center_y

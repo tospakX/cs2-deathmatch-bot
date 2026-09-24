@@ -44,8 +44,8 @@ class ScanningController:
         sensitivity: float = 1.0,
         m_yaw: float = 0.022,
         m_pitch: float = 0.022,
-        screen_size: tuple[int, int] = (3440, 1440),
-        fov_h: float = 122.0,
+        screen_size: tuple[int, int] = (1920, 1080),
+        fov_h: float = 106.0,
     ):
         self.personality = personality
         self.cx, self.cy = screen_center

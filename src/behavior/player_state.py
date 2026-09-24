@@ -172,12 +172,12 @@ class ReloadEpisode:
 class SpatialMemory:
     """Persistent directional memory of an enemy with true last_seen timestamp."""
 
-    screen_x: float  # Historical screen pixel reference (diagnostic/reference only)
-    screen_y: float  # Historical screen pixel reference (diagnostic/reference only)
-    yaw_offset_deg: float  # Current angular yaw offset relative to camera view
-    pitch_offset_deg: float  # Current angular pitch offset relative to camera view
-    last_seen_time: float
-    confidence: float
+    screen_x: float = 0.0  # Historical screen pixel reference (diagnostic/reference only)
+    screen_y: float = 0.0  # Historical screen pixel reference (diagnostic/reference only)
+    yaw_offset_deg: float = 0.0  # Current angular yaw offset relative to camera view
+    pitch_offset_deg: float = 0.0  # Current angular pitch offset relative to camera view
+    last_seen_time: float = 0.0
+    confidence: float = 1.0
     target_id: int = -1
     velocity: tuple[float, float] = (0.0, 0.0)  # Screen px/s estimated velocity
     uncertainty_deg: float = 1.0  # Grows with time elapsed since observation
@@ -192,9 +192,9 @@ class SpatialMemory:
         self,
         dt: float,
         current_time: float,
-        fov_h: float = 122.0,
-        screen_w: int = 3440,
-        screen_h: int = 1440,
+        fov_h: float = 106.0,
+        screen_w: int = 1920,
+        screen_h: int = 1080,
     ) -> None:
         """Advance time: extrapolate target velocity, grow uncertainty, and decay confidence."""
         age = current_time - self.last_seen_time
@@ -525,9 +525,9 @@ class PlayerState:
     def advance_spatial_memories(
         self,
         dt: float,
-        fov_h: float = 122.0,
-        screen_w: int = 3440,
-        screen_h: int = 1440,
+        fov_h: float = 106.0,
+        screen_w: int = 1920,
+        screen_h: int = 1080,
     ) -> None:
         """Advance time for all active spatial memories."""
         to_prune = []

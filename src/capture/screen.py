@@ -79,22 +79,28 @@ class ScreenCapture:
         self._frame_count += 1
 
         if self._backend == "dxcam":
-            frame = self._camera.get_latest_frame()
-            return frame  # Already BGR numpy array
+            try:
+                frame = self._camera.get_latest_frame()
+                return frame  # Already BGR numpy array
+            except Exception:
+                return None
 
         if self._backend == "mss":
-            mon = self._mss.monitors[self.monitor + 1]  # mss is 1-indexed
-            if self.region:
-                mon = {
-                    "left": self.region[0],
-                    "top": self.region[1],
-                    "width": self.region[2] - self.region[0],
-                    "height": self.region[3] - self.region[1],
-                }
-            shot = self._mss.grab(mon)
-            # mss returns BGRA, convert to BGR
-            frame = np.array(shot)[:, :, :3].copy()
-            return frame
+            try:
+                mon = self._mss.monitors[self.monitor + 1]  # mss is 1-indexed
+                if self.region:
+                    mon = {
+                        "left": self.region[0],
+                        "top": self.region[1],
+                        "width": self.region[2] - self.region[0],
+                        "height": self.region[3] - self.region[1],
+                    }
+                shot = self._mss.grab(mon)
+                # mss returns BGRA, convert to BGR
+                frame = np.array(shot)[:, :, :3].copy()
+                return frame
+            except Exception:
+                return None
 
         return None
 
@@ -120,3 +126,51 @@ class ScreenCapture:
             self._mss = None
 
         self._backend = None
+
+
+def detect_screen_resolution(monitor_idx: int = 0) -> tuple[int, int]:
+    """Detect display resolution for the requested monitor.
+
+    Attempts detection via mss monitors first, falling back to Win32 GetSystemMetrics.
+    Returns (width, height) in pixels. Defaults to (1920, 1080) if detection fails.
+    """
+    # 1. Try mss monitor enumeration
+    try:
+        import mss
+
+        with mss.mss() as s:
+            if len(s.monitors) > monitor_idx + 1:
+                mon = s.monitors[monitor_idx + 1]
+                w, h = int(mon["width"]), int(mon["height"])
+                if w > 0 and h > 0:
+                    return w, h
+            elif s.monitors:
+                mon = s.monitors[0]
+                w, h = int(mon["width"]), int(mon["height"])
+                if w > 0 and h > 0:
+                    return w, h
+    except Exception:
+        pass
+
+    # 2. Try Win32 GetSystemMetrics with DPI awareness
+    try:
+        import ctypes
+
+        try:
+            # PROCESS_PER_MONITOR_DPI_AWARE
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
+        user32 = ctypes.windll.user32
+        w = user32.GetSystemMetrics(0)
+        h = user32.GetSystemMetrics(1)
+        if w > 0 and h > 0:
+            return int(w), int(h)
+    except Exception:
+        pass
+
+    return 1920, 1080

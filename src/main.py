@@ -66,9 +66,22 @@ def load_config(path: str = "config/settings.yaml") -> dict:
 class Bot:
     """Main bot orchestrator running the authoritative behavioral pipeline."""
 
-    def __init__(self, personality_name: str | None = None):
-        self.config = load_config()
+    def __init__(
+        self,
+        personality_name: str | None = None,
+        map_name: str | None = None,
+        validated_config: dict | None = None,
+    ):
+        if validated_config is not None:
+            self.config = validated_config
+        else:
+            from src.utils.validator import validate_environment
+
+            val_res = validate_environment(auto_adapt_resolution=True, quiet=True)
+            self.config = val_res.config if val_res.config else load_config()
+
         self.running = False
+        self.map_name = map_name or self.config.get("bot", {}).get("map", "dust2")
 
         # Personality
         pname = personality_name or self.config["bot"]["default_personality"]
@@ -229,11 +242,27 @@ class Bot:
                 self.bc_policy = None
 
         # Load waypoints if available
-        map_name = "dust2"  # TODO: auto-detect map
-        wp_path = os.path.join(PROJECT_ROOT, "config", "maps", f"{map_name}.json")
+        wp_path = os.path.join(PROJECT_ROOT, "config", "maps", f"{self.map_name}.json")
         if os.path.exists(wp_path):
-            self.nav_graph.load(wp_path)
-            print(f"[Bot] Loaded waypoints for {map_name}")
+            try:
+                self.nav_graph.load(wp_path)
+                print(f"[Bot] Loaded {len(self.nav_graph.waypoints)} waypoints for {self.map_name}")
+            except Exception as e:
+                print(f"[Bot] WARNING: Failed to load waypoints for {self.map_name}: {e}")
+        else:
+            available = []
+            maps_dir = os.path.join(PROJECT_ROOT, "config", "maps")
+            if os.path.exists(maps_dir):
+                available = [
+                    f[:-5]
+                    for f in os.listdir(maps_dir)
+                    if f.endswith(".json") and not f.endswith("_areas.json")
+                ]
+            print(
+                f"[Bot] NOTICE: Waypoint file not found: {wp_path}\n"
+                f"[Bot] Available waypoint maps: {available if available else 'none'}\n"
+                f"[Bot] Safely falling back to visual obstacle avoidance (WallFollower)."
+            )
 
         self.running = True
         self._loop_start = time.perf_counter()
@@ -254,12 +283,22 @@ class Bot:
             self._main_loop()
         except KeyboardInterrupt:
             print("\n[Bot] Stopped by user.")
+        except Exception as e:
+            print(f"\n[Bot] ERROR in main loop: {e}")
+            import traceback
+
+            traceback.print_exc()
         finally:
             self.stop()
 
     def _release_input(self) -> None:
         """Let go of mouse and keyboard (used by pause and panic)."""
-        for cleanup in (self._stop_firing, self._release_all_movement, keyboard.release_all):
+        for cleanup in (
+            self._stop_firing,
+            self._release_all_movement,
+            keyboard.release_all,
+            mouse.release_all_buttons,
+        ):
             try:
                 cleanup()
             except Exception:
@@ -275,7 +314,7 @@ class Bot:
                 self.running = False
                 self._release_input()
                 try:
-                    self.logger.close()
+                    self.stop()
                 except Exception:
                     pass
                 os._exit(0)
@@ -567,10 +606,8 @@ class Bot:
     def stop(self) -> None:
         """Clean shutdown."""
         print("[Bot] Shutting down...")
-        self._stop_firing()
+        self._release_input()
         self.player_state.reset_spray()
-        self._release_all_movement()
-        keyboard.release_all()
         self.capture.stop()
         if self.debug:
             self.debug.cleanup()
@@ -590,13 +627,44 @@ def main():
         default=None,
         help="Personality profile (noob, average, tryhard)",
     )
+    parser.add_argument(
+        "--map",
+        "-m",
+        type=str,
+        default=None,
+        help="Map name (dust2, etc.) for waypoint navigation",
+    )
     parser.add_argument("--no-debug", action="store_true", help="Disable debug overlay")
+    parser.add_argument(
+        "--max-run-seconds",
+        type=int,
+        default=None,
+        help="Auto-stop failsafe duration in seconds (0 = unlimited)",
+    )
+    parser.add_argument(
+        "--check",
+        "--doctor",
+        action="store_true",
+        help="Run environment checks and exit",
+    )
     args = parser.parse_args()
 
-    bot = Bot(personality_name=args.personality)
+    if args.check:
+        from src.utils.validator import validate_environment
+
+        res = validate_environment(quiet=False)
+        sys.exit(0 if res.is_valid else 1)
+
+    bot = Bot(
+        personality_name=args.personality,
+        map_name=args.map,
+    )
 
     if args.no_debug:
         bot.debug = None
+
+    if args.max_run_seconds is not None:
+        bot._max_run_seconds = args.max_run_seconds
 
     bot.start()
 

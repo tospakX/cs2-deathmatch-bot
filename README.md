@@ -1,83 +1,156 @@
 # CS2 Deathmatch Bot
 
-A screen-reading bot that plays Counter-Strike 2 deathmatch from pixels alone:
-it sees the game through a YOLO detector, reads its own position off the
-minimap, and drives the mouse and keyboard like a player would. No game memory
-is read or written; everything is vision in, synthetic input out.
+A computer-vision behavioral simulation that plays Counter-Strike 2 deathmatch in private/offline matches from raw screen pixels alone.
 
-The goal is a bot that a spectator reads as a real player, not a perfect aimbot.
-Detection and aim are solid; navigation is the part under active work.
+The bot sees the game via YOLO object detection, tracks player location on the minimap, and generates continuous, human-like mouse and keyboard inputs via Win32 `SendInput`. No game memory is read or written; all inputs and perceptions are closed-loop vision in, synthetic input out.
 
-## Where things live
+> [!NOTE]
+> This project is designed strictly for offline, private server testing and behavioral simulation research. It does not contain anti-cheat evasion, bypasses, or stealth mechanisms.
 
-```
-src/
-  capture/      screen grab (dxcam, mss fallback)
-  vision/       YOLO detector, HUD reader, minimap (player-dot) reader
-  brain/        state machine (ROAMING/FIGHTING/...), decisions, threat sort
-  aim/          targeting, human-like mouse paths, recoil
-  movement/     A* pathfinding + face-aware waypoint navigation
-  humanizer/    reaction timing, aim mistakes, personality profiles
-  input/        Win32 SendInput keyboard + mouse
-  main.py       the orchestrator loop (capture -> detect -> decide -> act)
+---
 
-tools/          standalone helpers (record maps, calibrate, benchmark, tests)
-config/
-  settings.yaml main config (display, detection, minimap, navigation, keybinds)
-  maps/         recorded waypoint graphs, one JSON per map
-  personalities/ noob / average / tryhard behaviour profiles
-tests/          pytest suite for the pure logic (nav, minimap, input struct, ...)
-models/         the ONNX detection model
-```
+## Quick Start (Fresh Checkout to Offline Match)
 
-## Getting started
+### 1. Requirements & Installation
 
-```
-pip install -r requirements.txt          # runtime deps (Windows)
-pip install ruff pytest                   # dev tooling
-python -m pytest                          # run the suite
+- **OS**: Windows 10/11 (64-bit)
+- **Python**: 3.10, 3.11, or 3.12
+- **Resolution**: 1920x1080 (standard 16:9 fullscreen or borderless window)
+
+Open PowerShell or Command Prompt in the repository folder:
+
+```cmd
+:: Create and activate virtual environment
+python -m venv .venv
+.venv\Scripts\activate
+
+:: Install runtime and test dependencies
+pip install -r requirements.txt
+pip install ruff pytest
 ```
 
-### One-time CS2 radar setup
+### 2. Verify Your Setup
 
-The bot reads its position from the radar, so the radar must be a fixed map
-with a moving dot (not the default rotating, player-centred one). These are
-written to an `autoexec.cfg`; run them once in the console if needed:
+Run the pre-flight doctor to ensure dependencies, models, and screen resolution are valid:
 
+```cmd
+run.bat --check
 ```
+*(Alternatively: `python -m src.main --check` or `python tools/doctor.py`)*
+
+If any check fails, the doctor will display exact remediation steps.
+
+---
+
+## Running in a Local Offline CS2 Match
+
+### Step 1: Start CS2 in Practice Mode
+
+1. Launch Counter-Strike 2.
+2. Go to **Play** &rarr; **Practice** &rarr; **Deathmatch**.
+3. Select **Dust II** (or another supported map) and click **Go**.
+
+### Step 2: Configure Radar Console Commands
+
+The bot tracks its position hue-agnostically from a fixed minimap. Open the in-game developer console (`~`) and enter:
+
+```text
 cl_radar_rotate 0
 cl_radar_always_centered 0
 cl_radar_scale 0.4
 ```
 
-### Per-map workflow
+*(Tip: You can add these lines to your `autoexec.cfg` so they apply automatically.)*
 
+### Step 3: Start the Bot
+
+Run the launcher from PowerShell or Command Prompt:
+
+```cmd
+run.bat
 ```
-# 1. Confirm the bot can see your dot move (walk during the capture window):
-python tools/record_waypoints.py --map dust2 --preview
+*(Alternatively: `python -m src.main`)*
 
-# 2. Record a map by walking its routes (auto-saves after --record-secs):
-python tools/record_waypoints.py --map dust2 --record-secs 90
+Command-line options:
+- Select personality: `run.bat -p tryhard` (`noob`, `average`, or `tryhard`)
+- Select map: `run.bat -m dust2`
+- Disable debug overlay window: `run.bat --no-debug`
+- Custom timeout failsafe: `run.bat --max-run-seconds 60`
 
-# 3. Calibrate which way a mouse turn rotates the radar:
-python tools/calibrate_nav.py --write
+### Step 4: In-Game Hotkeys
 
-# 4. Run the bot:
-python -m src.main
+| Hotkey | Action | Description |
+|---|---|---|
+| `HOME` | **Pause / Resume** | Instantly releases keyboard and mouse buttons so you can take control. Press again to hand control back to the bot. |
+| `END` | **Emergency Stop** | Immediately kills the bot process and safely releases all inputs. |
+
+A dedicated 20ms watchdog thread polls these keys globally so they function even while CS2 is focused.
+
+---
+
+## Calibration (Optional / First-Time Setup)
+
+The bot comes pre-calibrated with verified coordinates for **1920x1080**. You only need calibration if you use non-standard resolutions or customized HUD scales.
+
+### 1. Screen & HUD Auto-Calibration
+To auto-detect your monitor resolution and apply the calibrated HUD bounding boxes:
+```cmd
+python tools/calibrate.py --auto
+```
+*(To manually verify or drag custom bounding boxes in a GUI window, run `python tools/calibrate.py --interactive`)*
+
+### 2. Navigation Turn Calibration
+To calibrate the heading error turn gain and turn direction against your in-game sensitivity:
+1. Join an offline match, stand in an open area facing a long sightline, and run:
+   ```cmd
+   python tools/calibrate_nav.py --write
+   ```
+2. Switch to CS2 before the countdown ends. The tool will walk forward, turn the camera, and save `nav_turn_gain` and `nav_invert_turn` to `config/settings.yaml`.
+
+### 3. Aim Scale Calibration
+To verify the relationship between mouse counts and in-game pixel displacement:
+1. Stand still in CS2 looking at a textured wall, then run:
+   ```cmd
+   python tools/calibrate_aim.py --write
+   ```
+
+---
+
+## Architecture Overview
+
+```text
+Perception:
+  Screen Capture (DXcam / mss fallback)
+    └── YOLOv8n Target Detector + Confirmation Filter
+    └── HUD Reader (Health, Armor, Ammo, Alive Status)
+    └── Minimap Reader (Hue-agnostic position & heading)
+
+Player State & Cognition:
+  PlayerState (Monotonic Clock abstraction, temporal state, health, spray)
+    └── PerceptionSystem (Hungarian assignment target tracking & SpatialMemory)
+    └── DecisionEngine (Attention, reaction latency, firing mode, movement)
+
+Motor Execution & Physical Input:
+  MotorPlanner (Minimum-jerk reaching trajectories, sub-step easing)
+    └── FiringController (Cycle timing, tap/burst/spray commitment, recoil compensation)
+    └── MovementController (Persistent strafing, counter-strafing, wall avoidance)
+    └── MotorExecutor -> Win32 SendInput (Mouse & Keyboard)
 ```
 
-### Safety hotkeys (work while CS2 is focused)
+---
 
-| Key | Action |
-|-----|--------|
-| `END`  | Stop the bot instantly and release all input |
-| `HOME` | Pause / resume — bot lets go of mouse + keyboard so you can take over |
+## Development & Testing
 
-A watchdog thread polls these every 20ms independent of the main loop, and the
-bot also auto-stops after `bot.max_run_seconds` (default 120s).
+Run the automated test suite, linter, and behavioral simulation:
 
-## Contributing
+```cmd
+:: 1. Run all pytest unit & integration tests
+python -m pytest
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the dev workflow, commit conventions,
-and the lint/test gates. [CLAUDE.md](CLAUDE.md) holds the standing rules for
-working in this repo.
+:: 2. Check code style and formatting
+ruff check src tests tools run.py
+ruff format --check src tests tools run.py
+
+:: 3. Run long-run offline behavioral simulation
+python tools/run_behavioral_simulation.py --personality all
+```

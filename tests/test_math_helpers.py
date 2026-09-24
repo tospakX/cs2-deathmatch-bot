@@ -75,10 +75,10 @@ def test_cubic_bezier():
 
 
 def test_screen_delta_to_mouse():
-    # FOV-based conversion: pixel offset -> angle (via focal length) -> mouse counts.
-    # focal = (3440/2) / tan(45deg) = 1720
-    # angle_x = atan2(100, 1720) = 3.328deg -> 3.328 / (2.0*0.022) = 75
-    dx, dy = screen_delta_to_mouse(100, 50, 2.0, 0.022, 0.022)
+    # FOV-based conversion with explicit parameters:
+    dx, dy = screen_delta_to_mouse(
+        100, 50, 2.0, 0.022, 0.022, screen_width=3440, fov_horizontal=90.0
+    )
 
     import math
 
@@ -87,8 +87,15 @@ def test_screen_delta_to_mouse():
     expected_dy = int(math.degrees(math.atan2(50, focal)) / (2.0 * 0.022))
     assert dx == expected_dx
     assert dy == expected_dy
-
-    # Smaller pixel deltas must produce smaller mouse moves (monotonic), and
-    # the near-crosshair regime stays roughly linear.
     assert dx == 75 and dy == 37
-    assert abs(dx) < abs(screen_delta_to_mouse(300, 50, 2.0, 0.022, 0.022)[0])
+
+    # Default 1920x1080 conversion:
+    dx_1080, dy_1080 = screen_delta_to_mouse(100, 50, 2.0, 0.022, 0.022)
+    focal_1080 = (1920 / 2.0) / math.tan(math.radians(106.0 / 2.0))
+    exp_dx_1080 = int(math.degrees(math.atan2(100, focal_1080)) / (2.0 * 0.022))
+    exp_dy_1080 = int(math.degrees(math.atan2(50, focal_1080)) / (2.0 * 0.022))
+    assert dx_1080 == exp_dx_1080
+    assert dy_1080 == exp_dy_1080
+
+    # Smaller pixel deltas must produce smaller mouse moves (monotonic)
+    assert abs(dx_1080) < abs(screen_delta_to_mouse(300, 50, 2.0, 0.022, 0.022)[0])

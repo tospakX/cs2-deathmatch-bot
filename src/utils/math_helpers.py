@@ -46,9 +46,9 @@ def screen_delta_to_mouse(
     sensitivity: float,
     m_yaw: float,
     m_pitch: float,
-    screen_width: int = 3440,
-    screen_height: int = 1440,
-    fov_horizontal: float = 90.0,
+    screen_width: int = 1920,
+    screen_height: int = 1080,
+    fov_horizontal: float = 106.0,
     scale: float = 1.0,
 ) -> tuple[int, int]:
     """Convert screen pixel delta to mouse movement counts.

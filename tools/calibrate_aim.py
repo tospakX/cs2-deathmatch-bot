@@ -21,6 +21,9 @@ enable_high_resolution_timer()
 
 import cv2
 import numpy as np
+import yaml
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 from src.capture.screen import ScreenCapture
 from src.input.mouse import move_relative
@@ -79,10 +82,17 @@ def main():
     h, w = frame.shape[:2]
     print(f"Resolution: {w}x{h}")
 
-    # Game settings
-    sensitivity = 0.85
-    m_yaw = 0.022
-    fov_h = 90.0
+    # Load game settings from config/settings.yaml
+    settings_path = os.path.join(PROJECT_ROOT, "config", "settings.yaml")
+    cfg = {}
+    if os.path.exists(settings_path):
+        with open(settings_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+
+    game_cfg = cfg.get("game", {})
+    sensitivity = float(game_cfg.get("sensitivity", 0.85))
+    m_yaw = float(game_cfg.get("m_yaw", 0.022))
+    fov_h = float(game_cfg.get("fov_horizontal", 106.0))
 
     # Calculate focal length
     half_fov = math.radians(fov_h / 2.0)
@@ -152,12 +162,28 @@ def main():
     scale = 1.0 / avg_ratio if avg_ratio > 0 else 1.0
 
     print()
-    print(f"{'=' * 55}")
+    print("=" * 60)
     print(f"  Actual/Expected pixel ratio: {avg_ratio:.3f}")
-    print(f"  Recommended scale factor:    {scale:.3f}")
-    print(f"{'=' * 55}")
-    print()
-    print(f"Tell me this scale: {scale:.3f}")
+    print(f"  Recommended aim scale factor: {scale:.3f}")
+    print("=" * 60)
+
+    import argparse
+
+    parser = argparse.ArgumentParser(description="CS2 Aim Scale Auto-Calibration")
+    parser.add_argument("--write", action="store_true", help="Save scale factor to settings.yaml")
+    args, _ = parser.parse_known_args()
+
+    if args.write:
+        cfg.setdefault("game", {})["aim_scale"] = round(scale, 3)
+        with open(settings_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(cfg, f, sort_keys=False)
+        print(f"\n[Calibrate] Saved game.aim_scale = {scale:.3f} to {settings_path}")
+    else:
+        print("\n(Run with --write to automatically save this to config/settings.yaml)")
+
+    print("\nNEXT STEPS:")
+    print("  1. If calibrated, launch the bot: run.bat (or: python -m src.main)")
+    print("  2. In-game, press HOME to pause/resume, or END to emergency stop.")
 
 
 if __name__ == "__main__":

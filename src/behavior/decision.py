@@ -50,9 +50,9 @@ class DecisionEngine:
         sensitivity: float = 1.0,
         m_yaw: float = 0.022,
         m_pitch: float = 0.022,
-        fov_h: float = 122.0,
-        screen_width: int = 3440,
-        screen_height: int = 1440,
+        fov_h: float = 106.0,
+        screen_width: int = 1920,
+        screen_height: int = 1080,
     ):
         self.personality = personality
         self.cx, self.cy = screen_center

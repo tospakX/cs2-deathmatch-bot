@@ -112,8 +112,8 @@ class PerceptionSystem:
     def __init__(
         self,
         screen_center: tuple[int, int],
-        screen_size: tuple[int, int] = (3440, 1440),
-        fov_h: float = 122.0,
+        screen_size: tuple[int, int] = (1920, 1080),
+        fov_h: float = 106.0,
     ):
         self.cx, self.cy = screen_center
         self.screen_w, self.screen_h = screen_size
