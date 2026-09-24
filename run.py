@@ -67,6 +67,9 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.delay < 0:
+        parser.error("--delay must be a non-negative integer (>= 0)")
+
     # 1. Pre-flight validation
     val_res = validate_environment(
         config_path="config/settings.yaml",
@@ -82,8 +85,20 @@ def main():
         print("\n[Launcher] Pre-flight check successful. Exiting (--check mode).")
         sys.exit(0)
 
-    # 2. Launch bot
-    print("\n[Launcher] Pre-flight checks passed! Starting bot...")
+    # 2. Check if CS2 is already running
+    from src.utils.validator import check_cs2_process_running
+
+    if not check_cs2_process_running():
+        print("\n" + "=" * 72)
+        print("  [WAITING] Counter-Strike 2 ('cs2.exe') is not currently running.")
+        print("  Please launch CS2, enter your offline/private match first,")
+        print("  and then run 'python run.py' again.")
+        print("=" * 72)
+        sys.exit(0)
+
+    # 3. Launch bot
+    print("\n[Launcher] Pre-flight checks passed and CS2 process detected!")
+    print("[Launcher] Starting bot...")
     print("[Launcher] Press HOME in CS2 to Pause/Resume, or END to Emergency Stop.")
     print("=" * 72 + "\n")
 

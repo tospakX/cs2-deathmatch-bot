@@ -72,7 +72,11 @@ class Bot:
         map_name: str | None = None,
         validated_config: dict | None = None,
         start_delay: int = 5,
+        require_cs2: bool = True,
     ):
+        if start_delay < 0:
+            raise ValueError(f"start_delay must be non-negative (>= 0), got {start_delay}")
+
         if validated_config is not None:
             self.config = validated_config
         else:
@@ -84,6 +88,7 @@ class Bot:
         self.running = False
         self.map_name = map_name or self.config.get("bot", {}).get("map", "dust2")
         self.start_delay = start_delay
+        self.require_cs2 = require_cs2
         self._max_run_seconds: int | None = None
 
         # Personality
@@ -267,8 +272,18 @@ class Bot:
                 f"[Bot] Safely falling back to visual obstacle avoidance (WallFollower)."
             )
 
+        if self.require_cs2:
+            from src.utils.validator import check_cs2_process_running
+
+            if not check_cs2_process_running():
+                print("\n" + "=" * 72)
+                print("  [Bot] Counter-Strike 2 ('cs2.exe') is not currently running.")
+                print("  Please launch CS2, enter your offline/private match first,")
+                print("  and then start the bot.")
+                print("=" * 72 + "\n")
+                return
+
         self.running = True
-        self._loop_start = time.perf_counter()
         if self._max_run_seconds is None:
             self._max_run_seconds = self.config.get("bot", {}).get("max_run_seconds", 120)
 
@@ -288,9 +303,18 @@ class Bot:
                 f"\n>>> Starting in {self.start_delay} seconds... Switch to Counter-Strike 2! <<<"
             )
             for i in range(self.start_delay, 0, -1):
+                if not self.running:
+                    print("\n[Bot] Aborted during countdown.")
+                    return
                 print(f"\r>>> Starting in {i}s... (switch to CS2)   ", end="", flush=True)
                 time.sleep(1)
+            if not self.running:
+                print("\n[Bot] Aborted during countdown.")
+                return
             print("\r>>> BOT ACTIVE - Press HOME to Pause, END to Stop. <<<            \n")
+
+        # Start runtime timer immediately before the actual main loop begins
+        self._loop_start = time.perf_counter()
 
         try:
             self._main_loop()
@@ -668,16 +692,30 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.delay < 0:
+        parser.error("--delay must be a non-negative integer (>= 0)")
+
     if args.check:
         from src.utils.validator import validate_environment
 
         res = validate_environment(quiet=False)
         sys.exit(0 if res.is_valid else 1)
 
+    from src.utils.validator import check_cs2_process_running
+
+    if not check_cs2_process_running():
+        print("\n" + "=" * 72)
+        print("  [Bot] Counter-Strike 2 ('cs2.exe') is not currently running.")
+        print("  Please launch CS2, enter your offline/private match first,")
+        print("  and then start the bot.")
+        print("=" * 72)
+        sys.exit(0)
+
     bot = Bot(
         personality_name=args.personality,
         map_name=args.map,
         start_delay=args.delay,
+        require_cs2=True,
     )
 
     if args.no_debug:

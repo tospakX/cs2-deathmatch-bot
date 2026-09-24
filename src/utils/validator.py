@@ -258,12 +258,13 @@ def validate_environment(
             f"Bot will safely use visual obstacle avoidance (WallFollower)."
         )
 
-    # 7. Check if CS2 is active
-    if check_cs2_running():
-        result.info.append("Counter-Strike 2: window/process detected and active")
+    # 7. Check if CS2 process is active
+    if check_cs2_process_running():
+        result.info.append("Counter-Strike 2: process 'cs2.exe' detected and running")
     else:
         result.warnings.append(
-            "Counter-Strike 2 is not currently running. Launch CS2 and join an offline match."
+            "Counter-Strike 2 process ('cs2.exe') is not running. "
+            "Launch CS2 and enter an offline match first."
         )
 
     if not quiet:
@@ -272,15 +273,69 @@ def validate_environment(
     return result
 
 
-def check_cs2_running() -> bool:
-    """Check if Counter-Strike 2 window or process is detected."""
+def check_cs2_process_running(target_process: str = "cs2.exe") -> bool:
+    """Check if the Counter-Strike 2 process ('cs2.exe') is currently running on Windows."""
+    # 1. Primary check: Win32 Toolhelp32 snapshot via ctypes (fast, in-process, zero-dependency)
     try:
         import ctypes
+        from ctypes import wintypes
 
-        hwnd = ctypes.windll.user32.FindWindowW(None, "Counter-Strike 2")
-        return bool(hwnd)
+        TH32CS_SNAPPROCESS = 0x00000002
+
+        class PROCESSENTRY32(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", ctypes.c_char * 260),
+            ]
+
+        kernel32 = getattr(ctypes.windll, "kernel32", None)
+        if kernel32 is not None:
+            snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+            if snapshot not in (-1, 0, None):
+                try:
+                    entry = PROCESSENTRY32()
+                    entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
+                    if kernel32.Process32First(snapshot, ctypes.byref(entry)):
+                        target_lower = target_process.lower()
+                        while True:
+                            exe = entry.szExeFile.decode("utf-8", errors="ignore").lower()
+                            if exe == target_lower:
+                                return True
+                            if not kernel32.Process32Next(snapshot, ctypes.byref(entry)):
+                                break
+                finally:
+                    kernel32.CloseHandle(snapshot)
     except Exception:
-        return False
+        pass
+
+    # 2. Secondary fallback: tasklist command via subprocess
+    try:
+        import subprocess
+
+        output = subprocess.check_output(
+            ["tasklist", "/fi", f"imagename eq {target_process}", "/fo", "csv", "/nh"],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            text=True,
+            timeout=2.0,
+        )
+        if target_process.lower() in output.lower():
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+# Backward-compatibility alias
+check_cs2_running = check_cs2_process_running
 
 
 def print_diagnostics_report(res: ValidationResult) -> None:
