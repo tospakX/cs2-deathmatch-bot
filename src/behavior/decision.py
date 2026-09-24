@@ -233,9 +233,7 @@ class DecisionEngine:
             ):
                 state.transition_phase(BotPhase.SCANNING)
                 action_type = "search"
-            elif state.spatial_memories or (
-                state.last_enemy_positions and (now - state.last_enemy_positions[-1][2] < 3.0)
-            ):
+            elif state.spatial_memories:
                 state.transition_phase(BotPhase.SCANNING)
                 action_type = "search"
             else:

@@ -11,8 +11,6 @@ This layer manages:
 
 from __future__ import annotations
 
-import math
-import random
 from typing import TYPE_CHECKING
 
 from src.utils.math_helpers import distance
@@ -166,32 +164,3 @@ class AttentionSystem:
             state.switch_target(best_target, "new_acquisition")
             state.attention_confidence = 0.2  # low initial confidence
             self._last_switch_time = now
-
-    def get_scan_direction(self, state: PlayerState) -> tuple[float, float] | None:
-        """When no targets are visible, suggest a direction to look.
-
-        Returns (dx, dy) relative mouse movement suggestion, or None.
-        Based on recent enemy positions, awareness, and personality.
-        """
-        p = self.personality
-
-        # Check recent enemy positions.
-        if state.last_enemy_positions:
-            # Look toward most recent enemy position.
-            last = state.last_enemy_positions[-1]
-            dx = last[0] - self.cx
-            dy = last[1] - self.cy
-            d = math.sqrt(dx * dx + dy * dy)
-            if d > 10:
-                # Scale to a reasonable scan amount, with personality influence.
-                scale = 15.0 + p.scanning_amplitude * 30.0
-                return (dx / d * scale, dy / d * scale * 0.5)
-
-        # Random scanning with personality influence.
-        if random.random() < p.scanning_frequency * 0.1:
-            amp = 20.0 + p.scanning_amplitude * 40.0
-            dx = random.gauss(0, amp)
-            dy = random.gauss(0, amp * 0.3)  # less vertical
-            return (dx, dy)
-
-        return None

@@ -416,10 +416,19 @@ class MotorPlanner:
         target_dx = mem.yaw_offset_deg / max(1e-5, deg_per_count_x)
         target_dy = mem.pitch_offset_deg / max(1e-5, deg_per_count_y)
 
-        # Smooth camera reorientation towards remembered location
+        # Smooth camera reorientation towards remembered location with realistic human speed cap
         gain = min(0.40, (0.25 + p.motor_speed * 0.20) * (dt / 0.033))
-        self._velocity_x = self._velocity_x * 0.6 + target_dx * gain
-        self._velocity_y = self._velocity_y * 0.6 + target_dy * gain
+        step_vx = target_dx * gain
+        step_vy = target_dy * gain
+        max_speed = 350.0 + p.motor_speed * 450.0  # realistic human turn speed cap
+        speed = math.hypot(step_vx, step_vy)
+        if speed > max_speed:
+            scale = max_speed / speed
+            step_vx *= scale
+            step_vy *= scale
+
+        self._velocity_x = self._velocity_x * 0.6 + step_vx
+        self._velocity_y = self._velocity_y * 0.6 + step_vy
 
         # If aligned with remembered location, settle
         if math.hypot(target_dx, target_dy) < 30.0:

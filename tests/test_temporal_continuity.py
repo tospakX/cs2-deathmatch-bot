@@ -37,6 +37,7 @@ from src.behavior.player_state import (
     TrackedTarget,
 )
 from src.behavior.scanning import ScanningController
+from src.utils.clock import FakeClock
 from src.utils.math_helpers import screen_delta_to_mouse
 from src.vision.detector import Detection
 
@@ -806,3 +807,171 @@ def test_motor_executor_high_cadence_substeps():
     # Trigger must have been released by the high-cadence check
     assert state.is_trigger_held is False
     assert "left" in dummy_mouse.mouse_ups
+
+
+def test_fake_clock_player_state_determinism():
+    """PlayerState with FakeClock advances deterministically without wall-clock time."""
+    clock = FakeClock(initial_time=100.0, default_dt=0.033)
+    state = PlayerState(clock=clock)
+    state.is_alive = True
+    assert state.now == 100.0
+    assert state.phase_start == 100.0
+
+    state.transition_phase(BotPhase.ROAMING)
+    assert state.phase == BotPhase.ROAMING
+    assert state.phase_start == 100.0
+
+    # Advance clock by 0.5s
+    clock.advance(0.5)
+    state.begin_tick()
+    assert abs(state.now - 100.5) < 1e-6
+    assert abs(state.time_in_phase - 0.5) < 1e-6
+    assert state.frame_count == 1
+
+
+def test_motor_executor_with_fake_clock():
+    """MotorExecutor executes deterministic sub-steps using FakeClock without thread sleeping."""
+    clock = FakeClock(initial_time=50.0)
+    p = PersonalityTraits(motor_speed=1.0, firing_discipline=0.8)
+    state = PlayerState(clock=clock)
+    state.is_alive = True
+
+    planner = MotorPlanner(
+        screen_center=(1720, 720),
+        sensitivity=1.0,
+        m_yaw=0.022,
+        m_pitch=0.022,
+        fov_h=90.0,
+        screen_width=3440,
+        screen_height=1440,
+        personality=p,
+    )
+    firing = FiringController(personality=p)
+    movement = MovementController(personality=p)
+    dummy_mouse = DummyMouse()
+    dummy_keyboard = DummyKeyboard()
+
+    executor = MotorExecutor(
+        player_state=state,
+        motor_planner=planner,
+        firing_controller=firing,
+        movement_controller=movement,
+        mouse_backend=dummy_mouse,
+        keyboard_backend=dummy_keyboard,
+        keybinds={"right": "d", "left": "a"},
+        clock=clock,
+    )
+
+    # Trigger held at t=50.0, planned duration 60ms
+    state.is_trigger_held = True
+    state.firing_episode.active = True
+    state.firing_episode.mode = "tap"
+    state.firing_episode.press_time = 50.0
+    state.firing_episode.trigger_hold_duration = 0.060
+
+    # Substeps until t=50.070 (70ms later)
+    executor.run_substeps_until(50.070, min_sleep=0.002)
+
+    assert state.is_trigger_held is False
+    assert "left" in dummy_mouse.mouse_ups
+    assert clock.now() >= 50.070
+
+
+def test_motor_executor_synchronizes_player_state_held_keys():
+    """MotorExecutor updates player_state.held_keys on counter-strafe transitions."""
+    clock = FakeClock(initial_time=20.0)
+    p = PersonalityTraits(motor_speed=1.0)
+    state = PlayerState(clock=clock)
+    state.is_alive = True
+
+    planner = MotorPlanner(
+        screen_center=(1720, 720),
+        sensitivity=1.0,
+        m_yaw=0.022,
+        m_pitch=0.022,
+        fov_h=90.0,
+        screen_width=3440,
+        screen_height=1440,
+        personality=p,
+    )
+    firing = FiringController(personality=p)
+    movement = MovementController(personality=p)
+    dummy_mouse = DummyMouse()
+    dummy_keyboard = DummyKeyboard()
+
+    executor = MotorExecutor(
+        player_state=state,
+        motor_planner=planner,
+        firing_controller=firing,
+        movement_controller=movement,
+        mouse_backend=dummy_mouse,
+        keyboard_backend=dummy_keyboard,
+        keybinds={"left": "a", "right": "d"},
+        clock=clock,
+    )
+
+    # Manually trigger counter-strafe braking to the right (key 'd')
+    movement._cs_state = CounterStrafeState.BRAKING
+    movement._counter_strafe_key = "right"
+    movement._counter_strafe_end = 20.060
+    movement._counter_strafe_settle_end = 20.090
+    state.held_keys.add("right")
+
+    # Run substeps until 20.070 (braking ends at 20.060)
+    executor.run_substeps_until(20.070, min_sleep=0.002)
+
+    # Key 'd' was released by executor and removed from held_keys
+    assert "d" in dummy_keyboard.released
+    assert "right" not in state.held_keys
+    assert movement._cs_state == CounterStrafeState.SETTLED
+
+
+def test_movement_approaching_lateral_commitment():
+    """Diagonal lateral key during APPROACHING remains held persistently without tick flapping."""
+    random.seed(42)
+    p = PersonalityTraits()
+    controller = MovementController(p)
+    state = PlayerState()
+    state.is_alive = True
+
+    det = make_det(1720, 720)
+    target = TrackedTarget(detection=det, target_id=1, frames_visible=10)
+
+    controller._current_phase = MovementPhase.APPROACHING
+    controller._phase_start = state.now
+    controller._phase_duration = 1.0
+    controller._current_direction = "left"
+
+    # Evaluate across 30 ticks
+    for _ in range(30):
+        state.begin_tick()
+        keys = controller.update(state, target, is_firing=False)
+        assert keys["forward"] is True
+        assert keys["left"] is True, "Lateral approach key must not flutter"
+
+
+def test_firing_episode_burst_overshoot_tolerance():
+    """Active burst does not drop trigger on brief small tracking overshoot."""
+    p = PersonalityTraits(firing_discipline=0.7)
+    controller = FiringController(personality=p)
+    state = PlayerState()
+    state.is_alive = True
+    state.aim_phase = AimPhase.TRACKING
+    state.firing_phase = FiringPhase.BURSTING
+
+    det = make_det(1720, 720, w=100.0, h=250.0)
+    target = TrackedTarget(detection=det, target_id=1, frames_visible=10)
+
+    # Start burst with good aim error
+    cmd = controller.update(state, target, err_dist=15.0)
+    assert cmd.is_firing is True
+    assert state.firing_episode.active is True
+    assert state.firing_episode.mode == "burst"
+    assert state.is_trigger_held is True
+
+    # Next tick with slight overshoot (e.g. 50px error), burst must remain committed
+    state.begin_tick()
+    cmd2 = controller.update(state, target, err_dist=50.0)
+    assert cmd2.is_firing is True
+    assert state.firing_episode.active is True
+    assert state.is_trigger_held is True, "Burst should tolerate minor tracking overshoot"

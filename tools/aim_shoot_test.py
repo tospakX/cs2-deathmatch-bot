@@ -10,25 +10,25 @@ Usage:
 Press Q in debug window or Ctrl+C to stop.
 """
 
-import sys
 import os
-import time
 import random
-import math
+import sys
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.utils.timer_setup import enable_high_resolution_timer
+
 enable_high_resolution_timer()
 
 import cv2
-import numpy as np
-from src.capture.screen import ScreenCapture
-from src.vision.detector import YOLODetector, Detection
-from src.vision.confirmation_filter import ConfirmationFilter
+
 from src.aim.aim_path import AimPath
+from src.capture.screen import ScreenCapture
 from src.input import mouse
 from src.utils.math_helpers import bbox_to_aim_point, distance, screen_delta_to_mouse
+from src.vision.confirmation_filter import ConfirmationFilter
+from src.vision.detector import YOLODetector
 
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "cs2_yolov8n.onnx")
 LOG_PATH = os.path.join(os.path.dirname(__file__), "diagnostic_log.txt")
@@ -70,14 +70,16 @@ def main():
     detector.load()
 
     conf_filter = ConfirmationFilter(
-        min_confirm_frames=2, max_missing_frames=3,
-        match_distance=200.0, match_size_ratio=0.3,
+        min_confirm_frames=2,
+        max_missing_frames=3,
+        match_distance=200.0,
+        match_size_ratio=0.3,
     )
 
     aim_path = AimPath()
 
     capture = ScreenCapture(target_fps=120)
-    backend = capture.start()
+    capture.start()
 
     # Auto-detect resolution
     time.sleep(0.5)
@@ -102,13 +104,13 @@ def main():
 
     # Fire settings
     bullets_per_burst = 8
-    bullet_interval = 0.1       # 100ms per bullet
+    bullet_interval = 0.1  # 100ms per bullet
     burst_cooldown_time = 0.15
-    recoil_per_bullet = 4       # Pull down per bullet
+    recoil_per_bullet = 4  # Pull down per bullet
 
     log.log(f"Settings: sens={sensitivity} fov={fov_h} burst={bullets_per_burst}")
 
-    print(f"\nRunning! Switch to CS2. Press Q to stop.\n")
+    print("\nRunning! Switch to CS2. Press Q to stop.\n")
 
     cv2.namedWindow("Bot Debug", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Bot Debug", 960, 540)
@@ -120,10 +122,9 @@ def main():
     cooldown_until = 0
     last_target_pos = None
     last_target_time = 0
-    target_lost_grace = 0.3       # Only keep firing 300ms after target gone
+    target_lost_grace = 0.3  # Only keep firing 300ms after target gone
     frame_count = 0
     reaction_until = 0
-    last_aim_dist = 999
 
     # FPS counter
     fps_counter = 0
@@ -182,8 +183,7 @@ def main():
             # Track target
             if target:
                 tcx, tcy = target.center
-                is_new = (last_target_pos is None or
-                         distance(last_target_pos, (tcx, tcy)) > 400)
+                is_new = last_target_pos is None or distance(last_target_pos, (tcx, tcy)) > 400
                 last_target_pos = (tcx, tcy)
                 last_target_time = now
 
@@ -204,17 +204,18 @@ def main():
             # ── AIM + FIRE LOGIC ──
             if has_target and now >= reaction_until:
                 aim_x, aim_y = bbox_to_aim_point(
-                    target.x1, target.y1, target.x2, target.y2,
+                    target.x1,
+                    target.y1,
+                    target.x2,
+                    target.y2,
                     head_aim=False,
                 )
                 dx_pixels = aim_x - cx
                 dy_pixels = aim_y - cy
                 screen_dist = distance((cx, cy), (aim_x, aim_y))
-                last_aim_dist = screen_dist
 
                 mouse_dx, mouse_dy = screen_delta_to_mouse(
-                    dx_pixels, dy_pixels, sensitivity, m_yaw, m_pitch,
-                    screen_w, screen_h, fov_h
+                    dx_pixels, dy_pixels, sensitivity, m_yaw, m_pitch, screen_w, screen_h, fov_h
                 )
 
                 if fire_state == FIRE_SHOOTING:
@@ -240,7 +241,9 @@ def main():
                         mouse.mouse_up("left")
                         fire_state = FIRE_COOLDOWN
                         cooldown_until = now + burst_cooldown_time
-                        log.log(f"BURST END: {bullets_fired} bullets, recoil={total_recoil_applied}")
+                        log.log(
+                            f"BURST END: {bullets_fired} bullets, recoil={total_recoil_applied}"
+                        )
                         total_recoil_applied = 0
                         status = "BURST END"
                     else:
@@ -258,8 +261,10 @@ def main():
                     # Only start new path if: no path active, or path is done and still far
                     if not aim_path.is_active:
                         aim_path.start(mouse_dx, mouse_dy)
-                        log.log(f"AIM PATH: dist={screen_dist:.0f}px mouse=({mouse_dx},{mouse_dy}) "
-                               f"steps={aim_path.remaining_steps}")
+                        log.log(
+                            f"AIM PATH: dist={screen_dist:.0f}px mouse=({mouse_dx},{mouse_dy}) "
+                            f"steps={aim_path.remaining_steps}"
+                        )
                     fire_state = FIRE_AIMING
                     status = f"AIMING ({screen_dist:.0f}px)"
 
@@ -329,16 +334,22 @@ def main():
 
                 for det in confirmed:
                     x1, y1, x2, y2 = int(det.x1), int(det.y1), int(det.x2), int(det.y2)
-                    is_target = (det == target)
+                    is_target = det == target
                     color = (0, 0, 255) if is_target else (0, 255, 0)
                     cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2 + is_target)
 
                 cv2.drawMarker(vis, (cx, cy), (255, 255, 255), cv2.MARKER_CROSS, 20, 2)
 
                 if fire_state == FIRE_SHOOTING:
-                    cv2.putText(vis, f"BURST {bullets_fired}/{bullets_per_burst}",
-                               (cx - 80, cy + 50),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                    cv2.putText(
+                        vis,
+                        f"BURST {bullets_fired}/{bullets_per_burst}",
+                        (cx - 80, cy + 50),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        (0, 0, 255),
+                        2,
+                    )
 
                 info = [
                     f"{status}",
@@ -346,8 +357,15 @@ def main():
                     f"Inf:{detector.inference_ms:.0f}ms FPS:{display_fps}",
                 ]
                 for i, line in enumerate(info):
-                    cv2.putText(vis, line, (10, 28 + i * 26),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    cv2.putText(
+                        vis,
+                        line,
+                        (10, 28 + i * 26),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 255, 255),
+                        2,
+                    )
 
                 h, w = vis.shape[:2]
                 if w > 1920:
@@ -360,10 +378,12 @@ def main():
 
             # Log every second
             if frame_count % 50 == 0:
-                log.log(f"TICK: f={frame_count} {status} fire={fire_state} "
-                       f"raw={len(raw)} conf={len(confirmed)} "
-                       f"bezier={'active' if aim_path.is_active else 'idle'} "
-                       f"inf={detector.inference_ms:.0f}ms fps={display_fps}")
+                log.log(
+                    f"TICK: f={frame_count} {status} fire={fire_state} "
+                    f"raw={len(raw)} conf={len(confirmed)} "
+                    f"bezier={'active' if aim_path.is_active else 'idle'} "
+                    f"inf={detector.inference_ms:.0f}ms fps={display_fps}"
+                )
 
     except KeyboardInterrupt:
         print("\nStopped by user.")

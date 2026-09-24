@@ -240,10 +240,10 @@ class PerceptionSystem:
                         pitch_offset_deg=pitch_deg,
                         last_seen_time=true_timestamp,
                         confidence=target.detection.confidence,
+                        target_id=target.target_id,
                         velocity=target.velocity_estimate,
                     )
                     state.spatial_memories.append(spatial)
-                    state.last_enemy_positions.append((px, py, true_timestamp))
 
                 to_remove.append(track_id)
 

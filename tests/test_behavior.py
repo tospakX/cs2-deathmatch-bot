@@ -37,6 +37,7 @@ from src.behavior.player_state import (
     FiringPhase,
     MovementPhase,
     PlayerState,
+    SpatialMemory,
     TrackedTarget,
 )
 from src.behavior.reaction import ReactionSystem
@@ -481,18 +482,28 @@ def test_death_and_respawn_resets_combat_state():
 
 
 def test_scanning_checks_last_seen_enemy_position():
-    """Scanning controller sweeps towards recently lost enemy location."""
+    """Scanning controller sweeps towards recently lost enemy location via SpatialMemory."""
     personality = PersonalityTraits(scanning_frequency=0.8)
     scanner = ScanningController(personality, screen_center=(1720, 720))
     state = PlayerState()
     state.is_alive = True
 
-    # Enemy was seen 1 second ago at (2000, 720) (to the right)
-    state.last_enemy_positions.append((2000.0, 720.0, state.now - 1.0))
+    # Enemy was seen 1 second ago at angular offset yaw=12.0 deg (to the right)
+    state.spatial_memories.append(
+        SpatialMemory(
+            screen_x=2000.0,
+            screen_y=720.0,
+            yaw_offset_deg=12.0,
+            pitch_offset_deg=0.0,
+            last_seen_time=state.now - 1.0,
+            confidence=0.85,
+            target_id=1,
+        )
+    )
 
     dx, dy = scanner.update(state)
     assert scanner._current_scan is not None
-    assert scanner._current_scan.reason == "check_last_seen"
+    assert scanner._current_scan.reason == "check_spatial_memory"
     assert scanner._current_scan.target_dx > 0
 
 

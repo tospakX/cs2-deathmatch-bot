@@ -244,15 +244,17 @@ class FiringController:
         can_fire = False
         if err_dist_px <= tight_threshold:
             can_fire = True
-        elif episode.active and episode.mode == "spray" and state.is_trigger_held:
-            # Committed sprayers tolerate brief tracking overshoot
+        elif episode.active and episode.mode in ("spray", "burst") and state.is_trigger_held:
+            # Committed sprayers/bursters tolerate brief tracking overshoot during sustained firing
             can_fire = err_dist_px <= (tight_threshold * 1.6)
-        else:
-            # Graded chance of premature / hurried shot
+        elif not episode.active:
+            # Graded chance of premature / hurried shot at episode initiation
             over_err = err_dist_px - tight_threshold
             panic_bonus = (1.0 - state.confidence) * 0.2 if state.health < 40 else 0.0
             premature_prob = max(0.0, 0.25 + panic_bonus - (over_err / 60.0))
             can_fire = random.random() < premature_prob
+        else:
+            can_fire = False
 
         if not can_fire:
             if state.is_trigger_held:

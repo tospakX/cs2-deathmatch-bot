@@ -9,11 +9,11 @@ or explicit state transitions.
 """
 
 import math
-import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
+from src.utils.clock import Clock, RealClock
 from src.vision.detector import Detection
 
 # ── Enumerations ─────────────────────────────────────────────────────────────
@@ -178,14 +178,15 @@ class SpatialMemory:
     pitch_offset_deg: float  # Current angular pitch offset relative to camera view
     last_seen_time: float
     confidence: float
+    target_id: int = -1
     velocity: tuple[float, float] = (0.0, 0.0)  # Screen px/s estimated velocity
     uncertainty_deg: float = 1.0  # Grows with time elapsed since observation
     decay_factor: float = 1.0  # Decays exponentially with age
 
     def update_camera_rotation(self, yaw_delta_deg: float, pitch_delta_deg: float) -> None:
         """Update relative angular offset when camera rotates."""
-        self.yaw_offset_deg -= yaw_delta_deg
-        self.pitch_offset_deg -= pitch_delta_deg
+        self.yaw_offset_deg = (self.yaw_offset_deg - yaw_delta_deg + 180.0) % 360.0 - 180.0
+        self.pitch_offset_deg = max(-89.0, min(89.0, self.pitch_offset_deg - pitch_delta_deg))
 
     def advance_time(
         self,
@@ -284,8 +285,9 @@ class PlayerState:
     situation. All behavioral subsystems read and write through it.
     """
 
-    def __init__(self):
-        self._now: float = time.perf_counter()
+    def __init__(self, clock: Clock | None = None):
+        self.clock: Clock = clock if clock is not None else RealClock()
+        self._now: float = self.clock.now()
 
         # ── Phase state ──────────────────────────────────────────────────
         self.phase: BotPhase = BotPhase.DEAD
@@ -387,13 +389,13 @@ class PlayerState:
     def now(self) -> float:
         return self._now
 
-    def begin_tick(self) -> None:
+    def begin_tick(self, now: float | None = None) -> None:
         """Call at the start of every main-loop tick."""
-        now = time.perf_counter()
-        self.tick_dt = max(0.001, min(0.2, now - self._now))
-        self._now = now
+        current_time = now if now is not None else self.clock.now()
+        self.tick_dt = max(0.001, min(0.2, current_time - self._now))
+        self._now = current_time
         self.frame_count += 1
-        self.last_tick_time = now
+        self.last_tick_time = current_time
 
     @property
     def time_in_phase(self) -> float:

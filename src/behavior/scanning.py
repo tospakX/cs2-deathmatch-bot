@@ -155,28 +155,7 @@ class ScanningController:
                 )
                 return (0.0, 0.0)
 
-        # Priority B: Check last seen enemy positions
-        if state.last_enemy_positions:
-            last_x, last_y, last_t = state.last_enemy_positions[-1]
-            if now - last_t < 4.0:
-                screen_dx = last_x - self.cx
-                screen_dy = last_y - self.cy
-                dist = math.hypot(screen_dx, screen_dy)
-                if dist > 30.0:
-                    state.last_enemy_positions.pop()
-                    duration = random.uniform(0.18, 0.35)
-                    pause = random.uniform(0.20, 0.45)
-                    self._current_scan = ScanAction(
-                        reason="check_last_seen",
-                        target_dx=screen_dx * 0.7,
-                        target_dy=screen_dy * 0.4,
-                        duration=duration,
-                        settle_pause=pause,
-                        start_time=now,
-                    )
-                    return (0.0, 0.0)
-
-        # Priority C: Natural corner checks / glances during roaming
+        # Priority B: Natural corner checks / glances during roaming
         if random.random() < p.scanning_frequency * 0.08:
             sweep_dir = random.choice([-1.0, 1.0])
             amplitude = (40.0 + p.scanning_amplitude * 80.0) * sweep_dir

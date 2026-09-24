@@ -31,6 +31,7 @@ class BehavioralTickRecord:
     firing_phase: str
     movement_phase: str
     movement_direction: str
+    movement_phase_start: float
     is_crouching: bool
     is_firing: bool
     is_trigger_held: bool
@@ -78,6 +79,7 @@ class BehaviorRecorder:
             firing_phase=state.firing_phase.name,
             movement_phase=state.movement_phase.name,
             movement_direction=state.movement_direction,
+            movement_phase_start=state.movement_phase_start,
             is_crouching=state.is_crouching,
             is_firing=state.is_trigger_held,
             is_trigger_held=state.is_trigger_held,
@@ -136,18 +138,27 @@ class BehaviorRecorder:
 
     def compute_movement_metrics(self) -> dict[str, float]:
         """Verify that movement directions do NOT follow robotic 100% left-right alternation."""
-        # Extract strafe episodes separated by pauses/holding or direction changes
+        # Extract strafe episodes separated by pauses/holding or episode boundaries
         episodes: list[str] = []
-        in_strafe = False
+        last_phase_start: float = -1.0
         current_dir = ""
         for r in self.records:
             if r.movement_phase == "STRAFING" and r.movement_direction in ("left", "right"):
-                if not in_strafe or r.movement_direction != current_dir:
+                # New strafe episode if phase start timestamp advances or direction changes
+                if r.movement_phase_start > 0:
+                    is_new = (
+                        abs(r.movement_phase_start - last_phase_start) > 0.001
+                        or r.movement_direction != current_dir
+                    )
+                else:
+                    is_new = not episodes or r.movement_direction != current_dir
+
+                if is_new:
                     episodes.append(r.movement_direction)
+                    last_phase_start = r.movement_phase_start
                     current_dir = r.movement_direction
-                    in_strafe = True
             else:
-                in_strafe = False
+                last_phase_start = -1.0
                 current_dir = ""
 
         same_transitions = 0

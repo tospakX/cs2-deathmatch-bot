@@ -179,7 +179,7 @@ class MovementController:
 
         elif self._current_phase == MovementPhase.APPROACHING:
             keys["forward"] = True
-            if self._current_direction in ("left", "right") and random.random() < 0.25:
+            if self._current_direction in ("left", "right"):
                 keys[self._current_direction] = True
 
         elif self._current_phase == MovementPhase.RETREATING:
@@ -201,6 +201,8 @@ class MovementController:
 
         state.movement_phase = self._current_phase
         state.movement_direction = self._current_direction
+        state.movement_phase_start = self._phase_start
+        state.movement_duration = self._phase_duration
         self.episode.phase = self._current_phase
         self.episode.direction = self._current_direction
         return keys
