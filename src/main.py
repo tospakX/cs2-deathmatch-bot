@@ -71,6 +71,7 @@ class Bot:
         personality_name: str | None = None,
         map_name: str | None = None,
         validated_config: dict | None = None,
+        start_delay: int = 5,
     ):
         if validated_config is not None:
             self.config = validated_config
@@ -82,6 +83,8 @@ class Bot:
 
         self.running = False
         self.map_name = map_name or self.config.get("bot", {}).get("map", "dust2")
+        self.start_delay = start_delay
+        self._max_run_seconds: int | None = None
 
         # Personality
         pname = personality_name or self.config["bot"]["default_personality"]
@@ -266,7 +269,8 @@ class Bot:
 
         self.running = True
         self._loop_start = time.perf_counter()
-        self._max_run_seconds = self.config["bot"].get("max_run_seconds", 120)
+        if self._max_run_seconds is None:
+            self._max_run_seconds = self.config.get("bot", {}).get("max_run_seconds", 120)
 
         # Dedicated watchdog thread polls the panic key every 20ms
         threading.Thread(target=self._panic_watchdog, daemon=True).start()
@@ -278,6 +282,15 @@ class Bot:
         if self._max_run_seconds:
             print(f"[Bot] Auto-stops after {self._max_run_seconds}s as a failsafe.")
         print(f"[Bot] Tick rate: {self.config['bot']['tick_rate']} Hz")
+
+        if self.start_delay > 0:
+            print(
+                f"\n>>> Starting in {self.start_delay} seconds... Switch to Counter-Strike 2! <<<"
+            )
+            for i in range(self.start_delay, 0, -1):
+                print(f"\r>>> Starting in {i}s... (switch to CS2)   ", end="", flush=True)
+                time.sleep(1)
+            print("\r>>> BOT ACTIVE - Press HOME to Pause, END to Stop. <<<            \n")
 
         try:
             self._main_loop()
@@ -642,6 +655,12 @@ def main():
         help="Auto-stop failsafe duration in seconds (0 = unlimited)",
     )
     parser.add_argument(
+        "--delay",
+        type=int,
+        default=5,
+        help="Countdown delay in seconds before activating inputs (default 5s)",
+    )
+    parser.add_argument(
         "--check",
         "--doctor",
         action="store_true",
@@ -658,6 +677,7 @@ def main():
     bot = Bot(
         personality_name=args.personality,
         map_name=args.map,
+        start_delay=args.delay,
     )
 
     if args.no_debug:

@@ -258,10 +258,29 @@ def validate_environment(
             f"Bot will safely use visual obstacle avoidance (WallFollower)."
         )
 
+    # 7. Check if CS2 is active
+    if check_cs2_running():
+        result.info.append("Counter-Strike 2: window/process detected and active")
+    else:
+        result.warnings.append(
+            "Counter-Strike 2 is not currently running. Launch CS2 and join an offline match."
+        )
+
     if not quiet:
         print_diagnostics_report(result)
 
     return result
+
+
+def check_cs2_running() -> bool:
+    """Check if Counter-Strike 2 window or process is detected."""
+    try:
+        import ctypes
+
+        hwnd = ctypes.windll.user32.FindWindowW(None, "Counter-Strike 2")
+        return bool(hwnd)
+    except Exception:
+        return False
 
 
 def print_diagnostics_report(res: ValidationResult) -> None:

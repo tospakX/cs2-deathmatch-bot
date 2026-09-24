@@ -54,6 +54,12 @@ def main():
         help="Auto-stop failsafe duration in seconds (0 = unlimited)",
     )
     parser.add_argument(
+        "--delay",
+        type=int,
+        default=5,
+        help="Countdown delay in seconds before activating inputs (default 5s)",
+    )
+    parser.add_argument(
         "--check",
         "--doctor",
         action="store_true",
@@ -85,6 +91,7 @@ def main():
         personality_name=args.personality,
         map_name=args.map,
         validated_config=val_res.config,
+        start_delay=args.delay,
     )
 
     if args.no_debug:
